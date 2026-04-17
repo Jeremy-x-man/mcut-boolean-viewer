@@ -48,41 +48,83 @@ mcut_viewer/
     └── glad_gl33/          # GLAD OpenGL 加载器
 ```
 
-## 构建依赖
+## 构建说明
 
-**Linux (Ubuntu/Debian):**
+本项目使用 CMake 构建，支持 Windows (MSVC/MinGW)、Linux 和 macOS。
 
-```bash
-sudo apt-get install -y \
-    cmake build-essential \
-    libglfw3-dev libgl1-mesa-dev \
-    libglm-dev
-```
+### 1. 准备 MCUT 库
 
-## 构建步骤
+首先需要编译 MCUT 库。推荐将 `mcut` 和 `mcut_viewer` 放在同一个父目录下。
 
 ```bash
-# 1. 克隆本项目
-git clone <this-repo> mcut_viewer
-cd mcut_viewer
-
-# 2. 构建 MCUT 库（需要先克隆 MCUT）
+# 克隆 MCUT
 git clone https://github.com/cutdigital/mcut.git
 mkdir mcut_build && cd mcut_build
+
+# Linux / macOS / MinGW:
 cmake ../mcut -DCMAKE_BUILD_TYPE=Release -DMCUT_BUILD_TUTORIALS=OFF -DMCUT_BUILD_TESTS=OFF
 make -j$(nproc)
-cd ..
 
-# 3. 构建 mcut_viewer
+# Windows (MSVC):
+cmake ../mcut -DMCUT_BUILD_TUTORIALS=OFF -DMCUT_BUILD_TESTS=OFF
+cmake --build . --config Release
+```
+
+### 2. 编译 mcut_viewer (Linux / macOS)
+
+```bash
+# 安装依赖 (Ubuntu/Debian)
+sudo apt-get install -y cmake build-essential libglfw3-dev libgl1-mesa-dev libglm-dev
+
+# 构建
+cd ../mcut_viewer
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-         -DMCUT_INCLUDE_DIR=../mcut/include \
-         -DMCUT_LIBRARY=../mcut_build/lib/libmcut.a
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# 4. 运行
+# 运行
 ./mcut_viewer
 ```
+
+### 3. 编译 mcut_viewer (Windows)
+
+在 Windows 上，推荐使用 **vcpkg** 安装 GLFW 和 GLM 依赖。
+
+**方案 A：使用 vcpkg + MSVC（推荐）**
+
+```cmd
+:: 1. 安装依赖
+vcpkg install glfw3:x64-windows glm:x64-windows
+
+:: 2. 配置 CMake (注意替换 vcpkg 工具链路径)
+cd mcut_viewer
+mkdir build && cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE="C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake"
+
+:: 3. 编译
+cmake --build . --config Release
+
+:: 4. 运行
+Release\mcut_viewer.exe
+```
+
+**方案 B：手动指定依赖路径 (无需 vcpkg)**
+
+如果你已经手动下载了预编译的 GLFW 和 GLM，可以通过环境变量或 CMake 变量指定路径：
+
+```cmd
+cd mcut_viewer
+mkdir build && cd build
+
+:: 配置 CMake
+cmake .. -DGLFW_DIR="C:/path/to/glfw" -DGLM_DIR="C:/path/to/glm"
+
+:: 编译
+cmake --build . --config Release
+```
+
+> **注意：** CMake 脚本会自动在相邻的 `../mcut` 和 `../mcut_build` 目录中寻找 MCUT 头文件和编译好的 `.lib` / `.a` 库文件。如果你的目录结构不同，请手动指定：
+> `cmake .. -DMCUT_DIR="<path/to/mcut>" -DMCUT_LIBRARY="<path/to/mcut.lib>"`
 
 ## 使用说明
 

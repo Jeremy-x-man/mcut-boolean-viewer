@@ -7,7 +7,16 @@
 #include <iostream>
 #include <unordered_map>
 #include <cstring>
+#include <cstdio>
 #include "RenderMesh.h"
+
+// Cross-platform sscanf: MSVC provides sscanf_s as the "safe" variant.
+// We alias it here so the rest of the code uses a single name.
+#ifdef _MSC_VER
+#  define MCUT_SSCANF sscanf_s
+#else
+#  define MCUT_SSCANF sscanf
+#endif
 
 /**
  * @brief Simple OBJ mesh loader that produces flat-shaded RenderMesh.
@@ -52,7 +61,7 @@ inline ObjData loadOBJ(const std::string& path) {
             while (ss >> vtok) {
                 // Handle v, v/vt, v/vt/vn, v//vn
                 int vi = 0;
-                sscanf(vtok.c_str(), "%d", &vi);
+                MCUT_SSCANF(vtok.c_str(), "%d", &vi);
                 if (vi < 0) vi = (int)positions.size() + vi + 1;
                 faceVerts.push_back((uint32_t)(vi - 1));
             }

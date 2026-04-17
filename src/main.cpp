@@ -15,6 +15,13 @@
  *  - Log panel showing MCUT debug output
  */
 
+// ---- Platform-specific ----
+#ifdef _WIN32
+#  define NOMINMAX
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>   // must come before gl.h on Windows
+#endif
+
 // ---- OpenGL / Window ----
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
