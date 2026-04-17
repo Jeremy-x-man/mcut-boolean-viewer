@@ -24,8 +24,12 @@ REM ============================================================================
 
 setlocal EnableDelayedExpansion
 
-set SCRIPT_DIR=%~dp0
-set SCRIPT_DIR=%SCRIPT_DIR:~0,-1%
+set "SCRIPT_DIR=%~dp0"
+set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+
+REM ---- Fix: Convert backslashes to forward slashes to avoid CMake escape issues ----
+set "SCRIPT_DIR_FWD=%SCRIPT_DIR:\=/%"
+
 set BUILD_TYPE=Release
 set BUILD_DEPS=1
 set BUILD_APP=1
@@ -42,9 +46,10 @@ echo Unknown argument: %~1
 exit /b 1
 :args_done
 
-set DEPS_BUILD_DIR=%SCRIPT_DIR%\deps_build
-set DEPS_INSTALL_DIR=%DEPS_BUILD_DIR%\install
-set APP_BUILD_DIR=%SCRIPT_DIR%\build
+REM ---- Use forward-slash paths for CMake to prevent escape sequences ----
+set "DEPS_BUILD_DIR=%SCRIPT_DIR_FWD%/deps_build"
+set "DEPS_INSTALL_DIR=%DEPS_BUILD_DIR%/install"
+set "APP_BUILD_DIR=%SCRIPT_DIR_FWD%/build"
 
 REM ---- Detect CPU cores -------------------------------------------------------
 for /f "tokens=2 delims==" %%i in ('wmic cpu get NumberOfLogicalProcessors /value 2^>nul ^| find "="') do set NPROC=%%i

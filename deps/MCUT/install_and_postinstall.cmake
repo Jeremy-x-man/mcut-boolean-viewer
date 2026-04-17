@@ -53,6 +53,7 @@ foreach(_candidate
     "${BINARY_DIR}/lib/libmcut.a"
     "${BINARY_DIR}/lib/static/libmcut.a"
     "${BINARY_DIR}/libmcut.a"
+    "${BINARY_DIR}/lib/Release/mcut.lib"
     "${BINARY_DIR}/Release/mcut.lib"
     "${BINARY_DIR}/lib/mcut.lib"
     "${BINARY_DIR}/lib/static/mcut.lib"
