@@ -33,6 +33,7 @@ public:
     }
 
     glm::vec3 getPosition() const { return m_position; }
+    float     getDistance()  const { return m_distance; }
 
     void setAspectRatio(float ratio) { m_aspectRatio = ratio; }
 

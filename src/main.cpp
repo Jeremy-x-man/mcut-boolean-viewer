@@ -9,10 +9,19 @@
  *  - Load OBJ meshes as Source Mesh (A) and Cut Mesh (B)
  *  - Execute Union / Intersection / Difference (A-B) / Difference (B-A) / All Fragments
  *  - Real-time 3D preview with arcball camera (drag to rotate, scroll to zoom)
+ *  - Interactive mesh dragging: Alt+Left-drag to move selected mesh in 3D
+ *    (auto-recomputes boolean result on release)
  *  - Toggle visibility and wireframe overlay per mesh
  *  - Color-coded result connected components with type labels
  *  - Export result connected components to OBJ
  *  - Log panel showing MCUT debug output
+ *
+ * Mouse Controls:
+ *   Left drag            : Orbit camera
+ *   Middle drag          : Pan camera
+ *   Scroll               : Zoom
+ *   Alt + Left drag      : Move selected mesh (A or B) in screen-parallel plane
+ *   Alt + Scroll         : Move selected mesh along camera forward axis (depth)
  */
 
 // ---- Platform-specific ----
@@ -68,6 +77,10 @@ static int    g_viewportW = 1280, g_viewportH = 720;
 static std::unique_ptr<RenderMesh> g_srcMesh;
 static std::unique_ptr<RenderMesh> g_cutMesh;
 
+// Per-mesh cumulative translation (world space)
+static glm::vec3 g_srcTranslation{0.0f};
+static glm::vec3 g_cutTranslation{0.0f};
+
 // Boolean manager
 static BooleanOpManager g_boolMgr;
 
@@ -91,10 +104,19 @@ static float g_srcAlpha     = 0.45f;
 static float g_cutAlpha     = 0.45f;
 static bool  g_showGrid     = true;
 static bool  g_autoFit      = true;
-static bool  g_autoHideInput = false;  // hide input meshes after running boolean
+static bool  g_autoHideInput = false;
 static char  g_exportDir[512] = "exports";
 static bool  g_exportSuccess  = false;
 static float g_exportMsgTimer = 0.0f;
+
+// ---- Drag state ----
+// 0 = none, 1 = drag Source (A), 2 = drag Cut (B)
+static int    g_dragTarget    = 1;   // which mesh is selected for dragging
+static bool   g_isDragging    = false;
+static glm::vec3 g_dragPlaneNormal{0.0f};  // screen-parallel plane normal
+static glm::vec3 g_dragPlanePoint{0.0f};   // point on drag plane (mesh center)
+static glm::vec3 g_dragStartWorld{0.0f};   // world pos at drag start
+static bool   g_needsBooleanUpdate = false; // set on drag release
 
 // Shader
 static Shader g_shader;
@@ -206,20 +228,20 @@ static void drawGrid(const glm::mat4& view, const glm::mat4& proj, const glm::ve
 }
 
 // ============================================================
-//  Render a RenderMesh
+//  Render a RenderMesh with optional model matrix
 // ============================================================
 static void drawMesh(const RenderMesh& mesh,
                      const glm::mat4& view, const glm::mat4& proj,
                      const glm::vec3& viewPos,
+                     const glm::mat4& modelMatrix,
                      bool wireOverlay = false)
 {
     if (!mesh.visible || mesh.VAO == 0 || mesh.indices.empty()) return;
 
     g_shader.use();
-    glm::mat4 model(1.0f);
-    glm::mat3 normalMat = glm::mat3(glm::transpose(glm::inverse(model)));
+    glm::mat3 normalMat = glm::mat3(glm::transpose(glm::inverse(modelMatrix)));
 
-    g_shader.setMat4("model", model);
+    g_shader.setMat4("model", modelMatrix);
     g_shader.setMat4("view", view);
     g_shader.setMat4("projection", proj);
     g_shader.setMat3("normalMatrix", normalMat);
@@ -245,6 +267,39 @@ static void drawMesh(const RenderMesh& mesh,
 }
 
 // ============================================================
+//  Ray-plane intersection helper
+//  Returns true and sets `hitPoint` if ray hits the plane.
+// ============================================================
+static bool rayPlaneIntersect(
+    const glm::vec3& rayOrigin, const glm::vec3& rayDir,
+    const glm::vec3& planeNormal, const glm::vec3& planePoint,
+    glm::vec3& hitPoint)
+{
+    float denom = glm::dot(planeNormal, rayDir);
+    if (std::abs(denom) < 1e-6f) return false;
+    float t = glm::dot(planeNormal, planePoint - rayOrigin) / denom;
+    if (t < 0.0f) return false;
+    hitPoint = rayOrigin + t * rayDir;
+    return true;
+}
+
+// ============================================================
+//  Unproject screen pixel to world-space ray
+// ============================================================
+static glm::vec3 screenToRayDir(double sx, double sy,
+                                 const glm::mat4& proj, const glm::mat4& view)
+{
+    // NDC
+    float ndcX = (float)(2.0 * sx / g_viewportW - 1.0);
+    float ndcY = (float)(1.0 - 2.0 * sy / g_viewportH);
+    glm::vec4 clipCoord(ndcX, ndcY, -1.0f, 1.0f);
+    glm::vec4 eyeCoord = glm::inverse(proj) * clipCoord;
+    eyeCoord = glm::vec4(eyeCoord.x, eyeCoord.y, -1.0f, 0.0f);
+    glm::vec3 worldDir = glm::vec3(glm::inverse(view) * eyeCoord);
+    return glm::normalize(worldDir);
+}
+
+// ============================================================
 //  Load mesh helpers
 // ============================================================
 static bool loadSrcMesh(const std::string& path) {
@@ -254,6 +309,7 @@ static bool loadSrcMesh(const std::string& path) {
     g_srcMesh = objDataToRenderMesh(obj, "Source (A)");
     g_srcMesh->color = {0.25f, 0.55f, 1.0f};
     g_srcMesh->alpha = g_srcAlpha;
+    g_srcTranslation = glm::vec3(0.0f);
     addLog("Loaded A: " + path
          + " (" + std::to_string(obj.vertices.size()/3) + " verts, "
          + std::to_string(obj.faceSizes.size()) + " faces)");
@@ -267,23 +323,31 @@ static bool loadCutMesh(const std::string& path) {
     g_cutMesh = objDataToRenderMesh(obj, "Cut (B)");
     g_cutMesh->color = {1.0f, 0.45f, 0.15f};
     g_cutMesh->alpha = g_cutAlpha;
+    g_cutTranslation = glm::vec3(0.0f);
     addLog("Loaded B: " + path
          + " (" + std::to_string(obj.vertices.size()/3) + " verts, "
          + std::to_string(obj.faceSizes.size()) + " faces)");
     return true;
 }
 
+// Compute world-space center of a mesh (accounting for its current translation)
+static glm::vec3 meshCenter(const RenderMesh* m, const glm::vec3& trans) {
+    if (!m) return glm::vec3(0.0f);
+    return (m->bbMin + m->bbMax) * 0.5f + trans;
+}
+
 static void fitCameraToScene() {
     glm::vec3 minBB(1e9f), maxBB(-1e9f);
-    auto expand = [&](const RenderMesh* m) {
+    auto expand = [&](const RenderMesh* m, const glm::vec3& t) {
         if (m && m->visible) {
-            minBB = glm::min(minBB, m->bbMin);
-            maxBB = glm::max(maxBB, m->bbMax);
+            minBB = glm::min(minBB, m->bbMin + t);
+            maxBB = glm::max(maxBB, m->bbMax + t);
         }
     };
-    expand(g_srcMesh.get());
-    expand(g_cutMesh.get());
-    for (auto& rm : g_boolMgr.resultMeshes) expand(rm.get());
+    expand(g_srcMesh.get(), g_srcTranslation);
+    expand(g_cutMesh.get(), g_cutTranslation);
+    for (auto& rm : g_boolMgr.resultMeshes)
+        expand(rm.get(), glm::vec3(0.0f));
     if (minBB.x < 1e8f) g_camera.fitBoundingBox(minBB, maxBB);
 }
 
@@ -317,6 +381,31 @@ static void exportResults() {
 }
 
 // ============================================================
+//  Run boolean (helper used by drag-release and button)
+// ============================================================
+static void runBoolean() {
+    if (!g_boolMgr.isContextValid() || !g_srcMesh || !g_cutMesh) return;
+    // Sync translations to boolean manager
+    g_boolMgr.setSourceTranslation(
+        (double)g_srcTranslation.x,
+        (double)g_srcTranslation.y,
+        (double)g_srcTranslation.z);
+    g_boolMgr.setCutTranslation(
+        (double)g_cutTranslation.x,
+        (double)g_cutTranslation.y,
+        (double)g_cutTranslation.z);
+
+    bool ok = g_boolMgr.execute((BoolOpType)g_selectedOp);
+    if (ok) {
+        if (g_autoHideInput) {
+            g_showSrcMesh = false;
+            g_showCutMesh = false;
+        }
+        if (g_autoFit) fitCameraToScene();
+    }
+}
+
+// ============================================================
 //  GLFW callbacks
 // ============================================================
 static void framebufferSizeCallback(GLFWwindow*, int w, int h) {
@@ -325,26 +414,109 @@ static void framebufferSizeCallback(GLFWwindow*, int w, int h) {
     g_camera.setAspectRatio((float)w / std::max(h, 1));
 }
 
-static void mouseButtonCallback(GLFWwindow*, int button, int action, int /*mods*/) {
+static void mouseButtonCallback(GLFWwindow* window, int button, int action, int /*mods*/) {
     if (ImGui::GetIO().WantCaptureMouse) return;
-    if (button == GLFW_MOUSE_BUTTON_LEFT)
-        g_mouseLeftDown = (action == GLFW_PRESS);
-    if (button == GLFW_MOUSE_BUTTON_MIDDLE)
+
+    bool altHeld = (glfwGetKey(window, GLFW_KEY_LEFT_ALT)  == GLFW_PRESS ||
+                    glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS);
+
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        if (action == GLFW_PRESS) {
+            g_mouseLeftDown = true;
+
+            if (altHeld && (g_dragTarget == 1 || g_dragTarget == 2)) {
+                // Begin drag
+                g_isDragging = true;
+
+                glm::mat4 view = g_camera.getViewMatrix();
+                glm::mat4 proj = g_camera.getProjectionMatrix();
+                glm::vec3 camPos = g_camera.getPosition();
+
+                // Drag plane: passes through mesh center, normal = camera forward
+                glm::vec3 center = (g_dragTarget == 1)
+                    ? meshCenter(g_srcMesh.get(), g_srcTranslation)
+                    : meshCenter(g_cutMesh.get(), g_cutTranslation);
+                g_dragPlanePoint  = center;
+                g_dragPlaneNormal = glm::normalize(camPos - center); // toward camera
+
+                // Compute world position of cursor at drag start
+                glm::vec3 rayDir = screenToRayDir(g_lastMouseX, g_lastMouseY, proj, view);
+                glm::vec3 hit;
+                if (rayPlaneIntersect(camPos, rayDir, g_dragPlaneNormal, g_dragPlanePoint, hit))
+                    g_dragStartWorld = hit;
+                else
+                    g_dragStartWorld = center;
+            }
+        } else { // GLFW_RELEASE
+            g_mouseLeftDown = false;
+            if (g_isDragging) {
+                g_isDragging = false;
+                g_needsBooleanUpdate = true;
+            }
+        }
+    }
+
+    if (button == GLFW_MOUSE_BUTTON_MIDDLE) {
         g_mouseMiddleDown = (action == GLFW_PRESS);
+    }
 }
 
-static void cursorPosCallback(GLFWwindow*, double x, double y) {
+static void cursorPosCallback(GLFWwindow* window, double x, double y) {
     if (ImGui::GetIO().WantCaptureMouse) { g_lastMouseX = x; g_lastMouseY = y; return; }
+
     double dx = x - g_lastMouseX;
     double dy = y - g_lastMouseY;
-    if (g_mouseLeftDown)   g_camera.orbit((float)dx, (float)dy);
+
+    bool altHeld = (glfwGetKey(window, GLFW_KEY_LEFT_ALT)  == GLFW_PRESS ||
+                    glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS);
+
+    if (g_mouseLeftDown && g_isDragging && altHeld) {
+        // Drag selected mesh
+        glm::mat4 view = g_camera.getViewMatrix();
+        glm::mat4 proj = g_camera.getProjectionMatrix();
+        glm::vec3 camPos = g_camera.getPosition();
+
+        glm::vec3 rayDir = screenToRayDir(x, y, proj, view);
+        glm::vec3 hit;
+        if (rayPlaneIntersect(camPos, rayDir, g_dragPlaneNormal, g_dragPlanePoint, hit)) {
+            glm::vec3 delta = hit - g_dragStartWorld;
+            if (g_dragTarget == 1) {
+                g_srcTranslation += delta;
+            } else {
+                g_cutTranslation += delta;
+            }
+            g_dragStartWorld = hit;
+        }
+    } else if (g_mouseLeftDown && !altHeld && !g_isDragging) {
+        g_camera.orbit((float)dx, (float)dy);
+    }
+
     if (g_mouseMiddleDown) g_camera.pan((float)dx, (float)dy);
-    g_lastMouseX = x; g_lastMouseY = y;
+
+    g_lastMouseX = x;
+    g_lastMouseY = y;
 }
 
-static void scrollCallback(GLFWwindow*, double /*xoff*/, double yoff) {
+static void scrollCallback(GLFWwindow* window, double /*xoff*/, double yoff) {
     if (ImGui::GetIO().WantCaptureMouse) return;
-    g_camera.zoom((float)yoff);
+
+    bool altHeld = (glfwGetKey(window, GLFW_KEY_LEFT_ALT)  == GLFW_PRESS ||
+                    glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS);
+
+    if (altHeld && (g_dragTarget == 1 || g_dragTarget == 2)) {
+        // Move mesh along camera forward axis (depth)
+        glm::vec3 camPos  = g_camera.getPosition();
+        glm::vec3 center  = (g_dragTarget == 1)
+            ? meshCenter(g_srcMesh.get(), g_srcTranslation)
+            : meshCenter(g_cutMesh.get(), g_cutTranslation);
+        glm::vec3 forward = glm::normalize(center - camPos);
+        float step = (float)yoff * g_camera.getDistance() * 0.05f;
+        if (g_dragTarget == 1) g_srcTranslation += forward * step;
+        else                   g_cutTranslation += forward * step;
+        g_needsBooleanUpdate = true;
+    } else {
+        g_camera.zoom((float)yoff);
+    }
 }
 
 // ============================================================
@@ -353,7 +525,7 @@ static void scrollCallback(GLFWwindow*, double /*xoff*/, double yoff) {
 static void renderUI(float dt) {
     // ---- Left panel: Controls ----
     ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({310, (float)g_viewportH}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({320, (float)g_viewportH}, ImGuiCond_Always);
     ImGui::Begin("MCUT Boolean Viewer", nullptr,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
@@ -383,6 +555,14 @@ static void renderUI(float dt) {
             g_srcMesh->color = {col[0], col[1], col[2]};
         ImGui::TextDisabled("   %zu verts  %zu tris",
             g_srcMesh->vertices.size(), g_srcMesh->indices.size()/3);
+        // Translation display
+        ImGui::TextDisabled("   pos (%.2f, %.2f, %.2f)",
+            g_srcTranslation.x, g_srcTranslation.y, g_srcTranslation.z);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##posA")) {
+            g_srcTranslation = glm::vec3(0.0f);
+            g_needsBooleanUpdate = true;
+        }
     }
 
     ImGui::Spacing();
@@ -410,6 +590,43 @@ static void renderUI(float dt) {
             g_cutMesh->color = {col[0], col[1], col[2]};
         ImGui::TextDisabled("   %zu verts  %zu tris",
             g_cutMesh->vertices.size(), g_cutMesh->indices.size()/3);
+        // Translation display
+        ImGui::TextDisabled("   pos (%.2f, %.2f, %.2f)",
+            g_cutTranslation.x, g_cutTranslation.y, g_cutTranslation.z);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##posB")) {
+            g_cutTranslation = glm::vec3(0.0f);
+            g_needsBooleanUpdate = true;
+        }
+    }
+
+    // ---- Section: Drag Control ----
+    ImGui::Spacing();
+    ImGui::SeparatorText("Drag Control");
+
+    // Drag target selector
+    ImGui::Text("Drag target:");
+    ImGui::SameLine();
+    bool selA = (g_dragTarget == 1);
+    bool selB = (g_dragTarget == 2);
+    if (selA) ImGui::PushStyleColor(ImGuiCol_Button, {0.15f, 0.40f, 0.80f, 1.0f});
+    if (ImGui::Button("  A  ##dragA")) g_dragTarget = 1;
+    if (selA) ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (selB) ImGui::PushStyleColor(ImGuiCol_Button, {0.70f, 0.30f, 0.05f, 1.0f});
+    if (ImGui::Button("  B  ##dragB")) g_dragTarget = 2;
+    if (selB) ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.9f, 0.7f, 1.0f));
+    ImGui::TextWrapped("Alt + Left drag : move selected mesh");
+    ImGui::TextWrapped("Alt + Scroll    : move along depth");
+    ImGui::PopStyleColor();
+
+    if (g_isDragging) {
+        ImGui::Spacing();
+        ImGui::TextColored({1.0f, 0.85f, 0.2f, 1.0f},
+            "Dragging %s ...", g_dragTarget == 1 ? "A" : "B");
     }
 
     // ---- Section: Boolean Operation ----
@@ -437,14 +654,7 @@ static void renderUI(float dt) {
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.10f, 0.40f, 0.70f, 1.0f});
     if (ImGui::Button("  Execute Boolean  ", {-1, 32})) {
         addLog("--- Running " + std::string(BoolOpNames[g_selectedOp]) + " ---");
-        bool ok = g_boolMgr.execute((BoolOpType)g_selectedOp);
-        if (ok) {
-            if (g_autoHideInput) {
-                g_showSrcMesh = false;
-                g_showCutMesh = false;
-            }
-            if (g_autoFit) fitCameraToScene();
-        }
+        runBoolean();
     }
     ImGui::PopStyleColor(3);
     if (!canRun) ImGui::EndDisabled();
@@ -486,25 +696,20 @@ static void renderUI(float dt) {
             auto& rm = g_boolMgr.resultMeshes[i];
             ImGui::PushID((int)i);
 
-            // Color swatch
             float col[3] = {rm->color.r, rm->color.g, rm->color.b};
             if (ImGui::ColorEdit3("##col", col, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
                 rm->color = {col[0], col[1], col[2]};
             ImGui::SameLine();
 
-            // Visibility checkbox with label
             ImGui::Checkbox(rm->label.c_str(), &rm->visible);
             ImGui::SameLine();
 
-            // Wireframe
             ImGui::Checkbox("W##w", &rm->showWire);
             ImGui::SameLine();
 
-            // Alpha slider
             ImGui::SetNextItemWidth(55);
             ImGui::SliderFloat("##a", &rm->alpha, 0.0f, 1.0f, "%.2f");
 
-            // Mesh stats
             ImGui::TextDisabled("   %zu v  %zu t",
                 rm->vertices.size(), rm->indices.size()/3);
             ImGui::PopID();
@@ -593,15 +798,20 @@ static void renderUI(float dt) {
 
     // ---- Help overlay (top-right) ----
     ImGui::SetNextWindowPos({(float)g_viewportW - 8, 8}, ImGuiCond_Always, {1, 0});
-    ImGui::SetNextWindowBgAlpha(0.50f);
+    ImGui::SetNextWindowBgAlpha(0.55f);
     ImGui::Begin("##help", nullptr,
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove);
-    ImGui::TextColored({0.8f, 0.8f, 0.8f, 1.0f}, "Mouse Controls:");
-    ImGui::Text("  Left drag   : Orbit");
-    ImGui::Text("  Middle drag : Pan");
-    ImGui::Text("  Scroll      : Zoom");
+    ImGui::TextColored({0.9f, 0.9f, 0.9f, 1.0f}, "Mouse Controls:");
+    ImGui::Text("  Left drag        : Orbit");
+    ImGui::Text("  Middle drag      : Pan");
+    ImGui::Text("  Scroll           : Zoom");
+    ImGui::Separator();
+    ImGui::TextColored({1.0f, 0.85f, 0.3f, 1.0f}, "Mesh Drag (Alt held):");
+    ImGui::Text("  Alt+Left drag    : Move mesh A or B");
+    ImGui::Text("  Alt+Scroll       : Move along depth");
+    ImGui::Text("  (select A/B in Drag Control panel)");
     ImGui::End();
 }
 
@@ -690,7 +900,7 @@ int main(int argc, char** argv) {
     } else {
         addLog("MCUT context initialized successfully.");
     }
-    addLog("MCUT Boolean Viewer  |  Drag to orbit  |  Scroll to zoom");
+    addLog("MCUT Boolean Viewer  |  Alt+drag to move mesh  |  Scroll to zoom");
 
     // ---- Default meshes ----
     if (loadSrcMesh(g_srcPath) && loadCutMesh(g_cutPath)) {
@@ -708,6 +918,15 @@ int main(int argc, char** argv) {
 
         glfwPollEvents();
 
+        // Trigger deferred boolean update (after drag release or scroll)
+        if (g_needsBooleanUpdate && !g_isDragging) {
+            g_needsBooleanUpdate = false;
+            if (g_boolMgr.hasResult || g_boolMgr.isContextValid()) {
+                addLog("--- Auto-update after drag ---");
+                runBoolean();
+            }
+        }
+
         // Sync visibility flags
         if (g_srcMesh) { g_srcMesh->visible = g_showSrcMesh; g_srcMesh->showWire = g_srcWireframe; }
         if (g_cutMesh) { g_cutMesh->visible = g_showCutMesh; g_cutMesh->showWire = g_cutWireframe; }
@@ -723,18 +942,33 @@ int main(int argc, char** argv) {
 
         if (g_showGrid) drawGrid(view, proj, viewPos);
 
-        // Draw source mesh (semi-transparent)
-        if (g_srcMesh && g_showSrcMesh)
-            drawMesh(*g_srcMesh, view, proj, viewPos, g_srcWireframe);
+        // Build model matrices with translation
+        glm::mat4 srcModel = glm::translate(glm::mat4(1.0f), g_srcTranslation);
+        glm::mat4 cutModel = glm::translate(glm::mat4(1.0f), g_cutTranslation);
 
-        // Draw cut mesh (semi-transparent)
-        if (g_cutMesh && g_showCutMesh)
-            drawMesh(*g_cutMesh, view, proj, viewPos, g_cutWireframe);
+        // Draw source mesh
+        if (g_srcMesh && g_showSrcMesh) {
+            // Highlight if selected for drag
+            float savedAlpha = g_srcMesh->alpha;
+            if (g_dragTarget == 1 && g_isDragging)
+                g_srcMesh->alpha = std::min(1.0f, savedAlpha + 0.25f);
+            drawMesh(*g_srcMesh, view, proj, viewPos, srcModel, g_srcWireframe);
+            g_srcMesh->alpha = savedAlpha;
+        }
 
-        // Draw result meshes
+        // Draw cut mesh
+        if (g_cutMesh && g_showCutMesh) {
+            float savedAlpha = g_cutMesh->alpha;
+            if (g_dragTarget == 2 && g_isDragging)
+                g_cutMesh->alpha = std::min(1.0f, savedAlpha + 0.25f);
+            drawMesh(*g_cutMesh, view, proj, viewPos, cutModel, g_cutWireframe);
+            g_cutMesh->alpha = savedAlpha;
+        }
+
+        // Draw result meshes (at identity — results already include translation)
         if (g_showResult) {
             for (auto& rm : g_boolMgr.resultMeshes)
-                drawMesh(*rm, view, proj, viewPos, rm->showWire);
+                drawMesh(*rm, view, proj, viewPos, glm::mat4(1.0f), rm->showWire);
         }
 
         // ---- ImGui ----

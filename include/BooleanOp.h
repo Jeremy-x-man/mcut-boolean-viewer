@@ -80,13 +80,33 @@ public:
 
     bool setSourceMesh(const ObjData& obj) {
         m_srcObj = obj;
+        m_srcTranslation = {0.0, 0.0, 0.0};
         return obj.valid;
     }
 
     bool setCutMesh(const ObjData& obj) {
         m_cutObj = obj;
+        m_cutTranslation = {0.0, 0.0, 0.0};
         return obj.valid;
     }
+
+    /**
+     * @brief Set the cumulative translation offset for the source mesh.
+     * This offset is applied to vertex coordinates at dispatch time.
+     */
+    void setSourceTranslation(double tx, double ty, double tz) {
+        m_srcTranslation = {tx, ty, tz};
+    }
+
+    /**
+     * @brief Set the cumulative translation offset for the cut mesh.
+     */
+    void setCutTranslation(double tx, double ty, double tz) {
+        m_cutTranslation = {tx, ty, tz};
+    }
+
+    std::array<double,3> getSourceTranslation() const { return m_srcTranslation; }
+    std::array<double,3> getCutTranslation()    const { return m_cutTranslation; }
 
     /**
      * @brief Execute the specified boolean operation.
@@ -113,20 +133,38 @@ public:
 
         log("Dispatching MCUT (" + std::string(BoolOpNames[(int)opType]) + ")...");
 
+        // Apply translation offsets to vertex arrays (copy to avoid modifying originals)
+        std::vector<double> srcVerts = m_srcObj.vertices;
+        if (m_srcTranslation[0] != 0.0 || m_srcTranslation[1] != 0.0 || m_srcTranslation[2] != 0.0) {
+            for (size_t v = 0; v < srcVerts.size(); v += 3) {
+                srcVerts[v+0] += m_srcTranslation[0];
+                srcVerts[v+1] += m_srcTranslation[1];
+                srcVerts[v+2] += m_srcTranslation[2];
+            }
+        }
+        std::vector<double> cutVerts = m_cutObj.vertices;
+        if (m_cutTranslation[0] != 0.0 || m_cutTranslation[1] != 0.0 || m_cutTranslation[2] != 0.0) {
+            for (size_t v = 0; v < cutVerts.size(); v += 3) {
+                cutVerts[v+0] += m_cutTranslation[0];
+                cutVerts[v+1] += m_cutTranslation[1];
+                cutVerts[v+2] += m_cutTranslation[2];
+            }
+        }
+
         auto t0 = std::chrono::high_resolution_clock::now();
 
         McResult err = mcDispatch(
             m_context,
             flags,
-            m_srcObj.vertices.data(),
+            srcVerts.data(),
             m_srcObj.faceIndices.data(),
             m_srcObj.faceSizes.data(),
-            (uint32_t)(m_srcObj.vertices.size() / 3),
+            (uint32_t)(srcVerts.size() / 3),
             (uint32_t)m_srcObj.faceSizes.size(),
-            m_cutObj.vertices.data(),
+            cutVerts.data(),
             m_cutObj.faceIndices.data(),
             m_cutObj.faceSizes.data(),
-            (uint32_t)(m_cutObj.vertices.size() / 3),
+            (uint32_t)(cutVerts.size() / 3),
             (uint32_t)m_cutObj.faceSizes.size());
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -173,6 +211,8 @@ private:
     McContext m_context = MC_NULL_HANDLE;
     ObjData   m_srcObj;
     ObjData   m_cutObj;
+    std::array<double,3> m_srcTranslation = {0.0, 0.0, 0.0};
+    std::array<double,3> m_cutTranslation = {0.0, 0.0, 0.0};
 
     // Predefined colors for result components
     static constexpr std::array<std::array<float,3>, 8> kColors = {{
