@@ -108,6 +108,9 @@ public:
     std::array<double,3> getSourceTranslation() const { return m_srcTranslation; }
     std::array<double,3> getCutTranslation()    const { return m_cutTranslation; }
 
+    const ObjData& getSourceObj() const { return m_srcObj; }
+    const ObjData& getCutObj()    const { return m_cutObj; }
+
     /**
      * @brief Execute the specified boolean operation.
      * @return true on success.
