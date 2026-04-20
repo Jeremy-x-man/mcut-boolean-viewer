@@ -525,7 +525,7 @@ static void renderThumbs() {
 //  Load mesh helpers
 // ============================================================
 static bool loadSrcMesh(const std::string& path) {
-    ObjData obj = loadOBJ(path);
+    ObjData obj = loadMesh(path);
     if (!obj.valid) { addLog("ERROR: Cannot load source mesh: " + path); return false; }
     g_boolMgr.setSourceMesh(obj);
     g_srcMesh = objDataToRenderMesh(obj, "Source (A)");
@@ -539,7 +539,7 @@ static bool loadSrcMesh(const std::string& path) {
 }
 
 static bool loadCutMesh(const std::string& path) {
-    ObjData obj = loadOBJ(path);
+    ObjData obj = loadMesh(path);
     if (!obj.valid) { addLog("ERROR: Cannot load cut mesh: " + path); return false; }
     g_boolMgr.setCutMesh(obj);
     g_cutMesh = objDataToRenderMesh(obj, "Cut (B)");
@@ -706,7 +706,7 @@ static void keyCallback(GLFWwindow* window, int key, int /*scancode*/, int actio
 // ============================================================
 static void renderPreviewPanel() {
     // Panel width
-    static const float kPanelW = 300.0f;
+    static const float kPanelW = g_viewportW / 3;
     ImGui::SetNextWindowPos({(float)g_viewportW - kPanelW, 0}, ImGuiCond_Always);
     ImGui::SetNextWindowSize({kPanelW, (float)g_viewportH}, ImGuiCond_Always);
     ImGui::Begin("Result Preview", nullptr,

@@ -76,6 +76,110 @@ inline ObjData loadOBJ(const std::string& path) {
     return data;
 }
 
+inline ObjData loadOFF(const std::string& path) {
+    ObjData data;
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "[ObjLoader] Cannot open: " << path << "\n";
+        return data;
+    }
+    auto next_line = [&](std::ifstream& f, std::string& s) -> bool {
+        while (getline(f, s)) {
+            if (s.length() > 1 && s[0] != '#') {
+                return true;
+            }
+        }
+        return false;
+        };
+    //
+    // file header
+    //
+    std::string header;
+    if (!next_line(file, header)) {
+        printf("error: .off file header not found\n");
+        return data;
+    }
+    if (header != "OFF") {
+        printf("error: unrecognised .off file header\n");
+        return data;
+    }
+    //
+    // #vertices, #faces, #edges
+    //
+    std::string info;
+    if (!next_line(file, info)) {
+        printf("error: .off element count not found\n");
+        return data;
+    }
+    std::istringstream info_stream;
+    info_stream.str(info);
+
+    int nvertices;
+    int nfaces;
+    int nedges;
+    info_stream >> nvertices >> nfaces >> nedges;
+
+    //
+    // vertices
+    //
+    std::vector<glm::vec3> positions;
+    positions.resize(nvertices);
+    for (int i = 0; i < nvertices; ++i) {
+        if (!next_line(file, info)) {
+            printf("error: .off vertex not found\n");
+            return data;
+        }
+        std::istringstream vtx_line_stream(info);
+
+        double x;
+        double y;
+        double z;
+        vtx_line_stream >> x >> y >> z;
+        positions.push_back({ x, y, z });
+        data.vertices.push_back((double)x);
+        data.vertices.push_back((double)y);
+        data.vertices.push_back((double)z);
+    }
+    //
+    // faces
+    //
+    for (auto i = 0; i < nfaces; ++i) {
+        if (!next_line(file, info)) {
+            printf("error: .off file face not found\n");
+            return data;
+        }
+        std::istringstream face_line_stream(info);
+        int n; // number of vertices in face
+        int index;
+        face_line_stream >> n;
+
+        if (n < 3) {
+            printf("error: invalid polygon vertex count in file (%d)\n", n);
+            return data;
+        }
+        for (int j = 0; j < n; ++j) {
+            face_line_stream >> index;
+            data.faceIndices.push_back(index);
+        }
+        data.faceSizes.push_back(n);
+    }
+    data.valid = !data.vertices.empty() && !data.faceSizes.empty();
+    return data;
+}
+
+inline ObjData loadMesh(const std::string& path) {
+    if (path.find(".obj") != std::string::npos || path.find(".OBJ") != std::string::npos) {
+        return loadOBJ(path);
+    }
+    else if (path.find(".off") != std::string::npos || path.find(".OFF") != std::string::npos) {
+        return loadOFF(path);
+    }
+    else {
+        std::cerr << "[ObjLoader] Unsupported file format: " << path << "\n";
+        return ObjData();
+    }
+}
+
 /**
  * @brief Convert ObjData to a RenderMesh (triangulated, with flat normals).
  */
