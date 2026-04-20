@@ -1,189 +1,151 @@
 # MCUT Boolean Viewer
 
-一个基于 **MCUT** 网格布尔运算库和 **ImGui** 图形界面库构建的交互式 3D 网格布尔运算预览工具。
+**MCUT Boolean Viewer** 是一个基于 [MCUT](https://github.com/cutdigital/mcut) 库的交互式网格布尔运算预览工具。它允许用户加载 3D 网格模型，实时预览并执行多种布尔运算（并集、交集、差集等），并直观地查看和导出结果的各个连通分量（Connected Components）。
 
-## 功能特性
+该项目采用 **ImGui** 构建现代化的用户界面，并使用 **OpenGL 3.3 Core** 实现高性能的 3D 实时渲染。
 
-| 功能 | 说明 |
-|------|------|
-| **布尔运算** | Union（并集）、Intersection（交集）、Difference A-B、Difference B-A、All Fragments |
-| **实时 3D 预览** | OpenGL 3.3 渲染，支持轨迹球旋转、平移、缩放 |
-| **连通分量展示** | 自动按类型着色（Fragment/Patch/Seam/Input），可单独控制显示/隐藏 |
-| **OBJ 导入** | 支持加载任意三角/多边形 OBJ 格式网格 |
-| **OBJ 导出** | 将布尔运算结果各连通分量导出为 OBJ 文件 |
-| **预设网格** | 内置 Cube+Torus、Sphere+Cube、Sphere+Cylinder 等 6 种预设组合 |
-| **MCUT Debug 日志** | 实时显示 MCUT 内部调试信息 |
+---
 
-## 技术栈
+## 🌟 核心特性
 
-- **MCUT** — 高精度网格布尔运算库（LGPL）
-- **ImGui** — 即时模式 GUI 库
-- **OpenGL 3.3 Core** — 渲染后端
-- **GLFW** — 窗口和输入管理
-- **GLAD** — OpenGL 函数加载器
-- **GLM** — 数学库
+- **多种布尔运算支持**
+  支持 Union（并集）、Intersection（交集）、Difference A-B（差集 A-B）、Difference B-A（差集 B-A）以及 All Fragments（提取所有碎片）。
+- **交互式网格拖动**
+  按住 `Alt` + 左键即可在 3D 视口中自由拖动选中的网格，松开鼠标后自动重新执行布尔运算并实时刷新结果。
+- **独立连通分量预览面板**
+  布尔运算生成的每个连通分量（CC）都会在右侧面板中拥有独立的缩略图预览（基于 FBO 离屏渲染），支持自动旋转、独立颜色编辑、可见性控制和单独导出 OBJ。
+- **状态快照与撤销/重做**
+  支持基于 Snapshot 的 Undo (`Ctrl+Z`) 和 Redo (`Ctrl+Y`)，自动记录每次网格移动和布尔运算的状态。
+- **自包含的一键构建系统**
+  采用类似 OrcaSlicer 的 `ExternalProject` 依赖管理方案，**无需手动安装任何第三方库，也无需 vcpkg**。所有依赖（MCUT, GLFW, GLM, ImGui, GLAD）会在配置阶段自动下载、编译并安装到本地目录。
 
-## 目录结构
+---
 
-```
-mcut_viewer/
-├── CMakeLists.txt          # 构建脚本
-├── src/
-│   └── main.cpp            # 主程序（渲染循环 + ImGui UI）
-├── include/
-│   ├── Camera.h            # 轨迹球相机
-│   ├── Shader.h            # GLSL 着色器工具类
-│   ├── RenderMesh.h        # GPU 网格容器
-│   ├── ObjLoader.h         # OBJ 解析器
-│   └── BooleanOp.h         # MCUT 布尔运算管理器
-├── assets/
-│   └── meshes/             # 内置测试网格
-│       ├── cube.obj
-│       ├── torus.obj
-│       ├── sphere.obj
-│       ├── cylinder.obj
-│       └── plane.obj
-└── third_party/
-    ├── imgui/              # ImGui 源码
-    └── glad_gl33/          # GLAD OpenGL 加载器
-```
+## 🛠️ 编译与构建（自包含依赖方案）
 
-## 构建说明
+本项目自带完整的依赖构建脚本，支持 Windows、Linux 和 macOS 平台。
 
-本项目使用 CMake 构建，支持 Windows (MSVC/MinGW)、Linux 和 macOS。
+### 前置环境要求
 
-### 1. 准备 MCUT 库
+- **CMake** (≥ 3.16)
+- **Git** (用于自动下载依赖源码)
+- **C++17 兼容的编译器** (GCC, Clang, 或 MSVC 2019/2022)
 
-首先需要编译 MCUT 库。推荐将 `mcut` 和 `mcut_viewer` 放在同一个父目录下。
-
+**Linux 额外依赖（窗口系统头文件）：**
 ```bash
-# 克隆 MCUT
-git clone https://github.com/cutdigital/mcut.git
-mkdir mcut_build && cd mcut_build
-
-# Linux / macOS / MinGW:
-cmake ../mcut -DCMAKE_BUILD_TYPE=Release -DMCUT_BUILD_TUTORIALS=OFF -DMCUT_BUILD_TESTS=OFF
-make -j$(nproc)
-
-# Windows (MSVC):
-cmake ../mcut -DMCUT_BUILD_TUTORIALS=OFF -DMCUT_BUILD_TESTS=OFF
-cmake --build . --config Release
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libgl1-mesa-dev \
+    libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
 ```
 
-### 2. 编译 mcut_viewer (Linux / macOS)
-
+**macOS 额外依赖：**
 ```bash
-# 安装依赖 (Ubuntu/Debian)
-sudo apt-get install -y cmake build-essential libglfw3-dev libgl1-mesa-dev libglm-dev
+xcode-select --install
+brew install cmake
+```
 
-# 构建
-cd ../mcut_viewer
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+### 🚀 一键构建命令
 
-# 运行
+#### Linux / macOS
+在项目根目录下，直接运行提供的 Shell 脚本：
+```bash
+# 赋予执行权限
+chmod +x build_deps.sh
+
+# 一键编译依赖和主程序（首次运行需下载依赖，约 5 分钟；后续为秒级）
+./build_deps.sh
+
+# 运行程序
+cd build
 ./mcut_viewer
 ```
 
-### 3. 编译 mcut_viewer (Windows)
-
-在 Windows 上，推荐使用 **vcpkg** 安装 GLFW 和 GLM 依赖。
-
-**方案 A：使用 vcpkg + MSVC（推荐）**
-
+#### Windows (MSVC)
+打开 **x64 Native Tools Command Prompt for VS 2022**（或 2019），在项目根目录下运行：
 ```cmd
-:: 1. 安装依赖
-vcpkg install glfw3:x64-windows glm:x64-windows
+:: 一键编译依赖和主程序（首次运行需下载依赖，约 10 分钟；后续为秒级）
+build_deps.bat
 
-:: 2. 配置 CMake (注意替换 vcpkg 工具链路径)
-cd mcut_viewer
-mkdir build && cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE="C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake"
-
-:: 3. 编译
-cmake --build . --config Release
-
-:: 4. 运行
-Release\mcut_viewer.exe
+:: 运行程序
+cd build\Release
+mcut_viewer.exe
 ```
 
-**方案 B：手动指定依赖路径 (无需 vcpkg)**
+### 🔧 高级构建选项
 
-如果你已经手动下载了预编译的 GLFW 和 GLM，可以通过环境变量或 CMake 变量指定路径：
+构建脚本支持以下参数，用于增量编译或指定构建类型：
 
-```cmd
-cd mcut_viewer
-mkdir build && cd build
+| 命令参数 | 说明 |
+|----------|------|
+| `Release` / `Debug` | 指定构建类型（默认为 Release） |
+| `--app-only` | **常用：** 仅重新编译主程序（当你修改了 `src/main.cpp` 等源码时使用，跳过依赖检查，速度极快） |
+| `--deps-only` | 仅编译依赖库（不编译主程序） |
+| `clean` | 删除所有构建目录（`build/` 和 `deps_build/`），用于彻底重建 |
 
-:: 配置 CMake
-cmake .. -DGLFW_DIR="C:/path/to/glfw" -DGLM_DIR="C:/path/to/glm"
+**示例（修改代码后快速增量编译）：**
+```bash
+# Linux/macOS
+./build_deps.sh --app-only
 
-:: 编译
-cmake --build . --config Release
+# Windows
+build_deps.bat --app-only
 ```
 
-> **注意：** CMake 脚本会自动在相邻的 `../mcut` 和 `../mcut_build` 目录中寻找 MCUT 头文件和编译好的 `.lib` / `.a` 库文件。如果你的目录结构不同，请手动指定：
-> `cmake .. -DMCUT_DIR="<path/to/mcut>" -DMCUT_LIBRARY="<path/to/mcut.lib>"`
+---
 
-## 使用说明
+## 🎮 使用指南
 
-### 基本操作
+### 界面布局
+程序启动后分为三个主要区域：
+1. **左侧控制面板 (Controls)**：负责网格加载、预设选择、布尔运算类型切换以及执行按钮。
+2. **中央 3D 视口 (Viewport)**：显示源网格（Source Mesh, A）和切割网格（Cut Mesh, B），支持相机交互。
+3. **右侧预览面板 (Result Preview)**：布尔运算执行后，此处将分层列出所有生成的连通分量，并提供独立的 3D 缩略图和导出按钮。
 
-| 操作 | 说明 |
-|------|------|
-| 左键拖拽 | 旋转视角（轨迹球） |
-| 中键拖拽 | 平移视角 |
-| 滚轮 | 缩放 |
+### 鼠标与键盘交互
 
-### 工作流程
+**相机控制（中央视口）：**
+- **左键拖动**：轨道旋转 (Orbit)
+- **中键拖动**：平移视口 (Pan)
+- **滚轮滚动**：缩放 (Zoom)
 
-1. **加载网格**：在 "A Source Mesh" 和 "B Cut Mesh" 输入框中填写 OBJ 路径，点击 `Load`
-2. **选择运算**：在 "Boolean Operation" 面板中选择运算类型
-3. **执行运算**：点击 `Execute Boolean` 按钮
-4. **查看结果**：在 "Results" 面板中查看各连通分量，可单独控制显示
-5. **导出结果**：填写导出目录，点击 `Export OBJ`
+**网格拖动（实时布尔预览）：**
+- **Alt + 左键拖动**：在平行于屏幕的平面上移动当前选中的网格（在左侧 Drag Control 中切换目标 A/B）。
+- **Alt + 滚轮滚动**：沿相机深度轴前后移动网格。
+- *提示：拖动结束后松开鼠标，程序会自动重新执行布尔运算并刷新结果。*
 
-### 布尔运算说明
+**快捷键：**
+- **Ctrl + Z**：撤销 (Undo) 上一步操作（网格移动或布尔运算更改）。
+- **Ctrl + Y**：重做 (Redo)。
 
-| 运算 | MCUT Filter Flags | 说明 |
-|------|-------------------|------|
-| Union (A \| B) | `SEALING_OUTSIDE \| LOCATION_ABOVE` | A 和 B 的并集 |
-| Intersection (A & B) | `SEALING_INSIDE \| LOCATION_BELOW` | A 和 B 的交集 |
-| Difference A - B | `SEALING_INSIDE \| LOCATION_ABOVE` | A 减去 B |
-| Difference B - A | `SEALING_OUTSIDE \| LOCATION_BELOW` | B 减去 A |
-| All Fragments | `MC_DISPATCH_FILTER_ALL` | 所有连通分量 |
+---
 
-### 连通分量颜色编码
+## 📂 目录结构说明
 
-| 类型 | 颜色 | 说明 |
-|------|------|------|
-| Fragment | 亮色（蓝/绿/橙） | 布尔运算结果片段 |
-| Patch | 黄色 | 切割补丁 |
-| Seam | 粉色（带线框） | 缝合线 |
-| Input | 灰色（半透明） | 输入网格副本 |
-
-## 架构说明
-
-### BooleanOpManager
-
-`BooleanOp.h` 中的核心类，封装了 MCUT 的完整生命周期：
-
-```cpp
-BooleanOpManager mgr;
-mgr.init();                    // 创建 McContext（需在 OpenGL 初始化后调用）
-mgr.setSourceMesh(srcObj);     // 设置源网格
-mgr.setCutMesh(cutObj);        // 设置切割网格
-mgr.execute(BoolOpType::UNION);// 执行布尔运算
-// 结果在 mgr.resultMeshes 中
+```text
+mcut-boolean-viewer/
+├── build_deps.sh          # Linux/macOS 一键构建脚本
+├── build_deps.bat         # Windows 一键构建脚本
+├── CMakeLists.txt         # 主程序 CMake 配置
+├── deps/                  # 依赖库构建系统 (ExternalProject_Add)
+│   ├── CMakeLists.txt     # 自动下载/编译 MCUT, GLFW, GLM, ImGui
+│   └── ...
+├── src/
+│   └── main.cpp           # 主程序入口、渲染循环与 UI 逻辑
+├── include/
+│   ├── BooleanOp.h        # 核心：MCUT 布尔运算封装与执行
+│   ├── Camera.h           # 轨迹球相机实现
+│   ├── ObjLoader.h        # 简易 OBJ 文件解析器
+│   ├── RenderMesh.h       # OpenGL 网格渲染封装
+│   └── Shader.h           # GLSL 着色器编译与管理
+├── shaders/               # 顶点与片段着色器
+├── assets/meshes/         # 内置的测试网格 (Cube, Sphere, Torus 等)
+└── third_party/
+    └── glad_gl33/         # 预生成的 GLAD (OpenGL 3.3 Core) 源码
 ```
 
-### 渲染管线
+---
 
-采用 OpenGL 3.3 Core Profile，两遍渲染：
-1. **实体渲染**：双面 Phong 光照，支持 alpha 混合
-2. **线框叠加**：可选的黑色线框覆盖层
+## 📜 开源协议
 
-## License
-
-本项目代码采用 MIT License。MCUT 库采用 LGPL v3 License。
+本项目自身代码采用 MIT 协议开源。
+请注意，本项目依赖的 [MCUT](https://github.com/cutdigital/mcut) 库是双重授权软件（GNU LGPL v3+ 或商业授权）。如果您在商业产品中使用本工具或 MCUT，请务必遵守 MCUT 的开源协议或获取其商业授权。
