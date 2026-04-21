@@ -60,7 +60,7 @@ struct CCSnapshot {
 
 struct AppSnapshot {
     std::string   srcPath, cutPath;
-    ObjData       srcObj,  cutObj;
+    MeshModel     srcObj, cutObj;
     glm::vec3     srcTranslation{0.0f}, cutTranslation{0.0f};
     int           opType = 0;
     double        dispatchTimeMs = 0.0;
@@ -387,16 +387,16 @@ static void restoreSnapshot(const AppSnapshot& snap) {
     g_selectedOp     = snap.opType;
 
     // Restore source mesh GPU
-    if (snap.srcObj.valid) {
+    if (snap.srcObj.isValid()) {
         g_boolMgr.setSourceMesh(snap.srcObj);
-        g_srcMesh = objDataToRenderMesh(snap.srcObj, "Source (A)");
+        g_srcMesh = meshModelToRenderMesh(snap.srcObj.data, "Source (A)");
         g_srcMesh->color = {0.25f, 0.55f, 1.0f};
         g_srcMesh->alpha = g_srcAlpha;
     }
     // Restore cut mesh GPU
-    if (snap.cutObj.valid) {
+    if (snap.cutObj.isValid()) {
         g_boolMgr.setCutMesh(snap.cutObj);
-        g_cutMesh = objDataToRenderMesh(snap.cutObj, "Cut (B)");
+        g_cutMesh = meshModelToRenderMesh(snap.cutObj.data, "Cut (B)");
         g_cutMesh->color = {1.0f, 0.45f, 0.15f};
         g_cutMesh->alpha = g_cutAlpha;
     }
@@ -525,30 +525,36 @@ static void renderThumbs() {
 //  Load mesh helpers
 // ============================================================
 static bool loadSrcMesh(const std::string& path) {
-    ObjData obj = loadMesh(path);
-    if (!obj.valid) { addLog("ERROR: Cannot load source mesh: " + path); return false; }
+    MeshModel obj;
+    if(!loadMesh(path, obj)){
+        addLog("ERROR: Cannot load source mesh: " + path);
+        return false;
+	}
     g_boolMgr.setSourceMesh(obj);
-    g_srcMesh = objDataToRenderMesh(obj, "Source (A)");
+    g_srcMesh = meshModelToRenderMesh(obj.data, "Source (A)");
     g_srcMesh->color = {0.25f, 0.55f, 1.0f};
     g_srcMesh->alpha = g_srcAlpha;
     g_srcTranslation = glm::vec3(0.0f);
     addLog("Loaded A: " + path
-         + " (" + std::to_string(obj.vertices.size()/3) + " verts, "
-         + std::to_string(obj.faceSizes.size()) + " faces)");
+         + " (" + std::to_string(obj.numVertices()) + " verts, "
+         + std::to_string(obj.numFaces()) + " faces)");
     return true;
 }
 
 static bool loadCutMesh(const std::string& path) {
-    ObjData obj = loadMesh(path);
-    if (!obj.valid) { addLog("ERROR: Cannot load cut mesh: " + path); return false; }
+    MeshModel obj;
+    if (!loadMesh(path, obj)) {
+        addLog("ERROR: Cannot load source mesh: " + path);
+        return false;
+    }
     g_boolMgr.setCutMesh(obj);
-    g_cutMesh = objDataToRenderMesh(obj, "Cut (B)");
+    g_cutMesh = meshModelToRenderMesh(obj.data, "Cut (B)");
     g_cutMesh->color = {1.0f, 0.45f, 0.15f};
     g_cutMesh->alpha = g_cutAlpha;
     g_cutTranslation = glm::vec3(0.0f);
     addLog("Loaded B: " + path
-         + " (" + std::to_string(obj.vertices.size()/3) + " verts, "
-         + std::to_string(obj.faceSizes.size()) + " faces)");
+         + " (" + std::to_string(obj.numVertices()) + " verts, "
+         + std::to_string(obj.numFaces()) + " faces)");
     return true;
 }
 
@@ -730,7 +736,7 @@ static void renderPreviewPanel() {
 
     float availW = ImGui::GetContentRegionAvail().x;
     // Fit thumb size to panel width (at most kThumbW)
-    float thumbDisp = std::min(availW - 8.0f, (float)kThumbW);
+    float thumbDisp = std::min(availW - 8.0f, std::max((float)kThumbW, kPanelW));
 
     for (size_t i = 0; i < g_boolMgr.resultMeshes.size() && i < g_thumbs.size(); ++i) {
         auto& rm = g_boolMgr.resultMeshes[i];
@@ -811,8 +817,8 @@ static void renderPreviewPanel() {
 //  Left-side control panel
 // ============================================================
 static void renderControlPanel(float dt) {
-    static const float kPanelW = 300.0f;
-    static const float kPreviewW = 300.0f;  // right panel width
+    static const float kPanelW = g_viewportW / 3;
+    static const float kPreviewW = kPanelW;  // right panel width
     float mainW = (float)g_viewportW - kPanelW - kPreviewW;
     (void)mainW;
 

@@ -139,8 +139,6 @@ mcut-boolean-viewer/
 │   └── Shader.h           # GLSL 着色器编译与管理
 ├── shaders/               # 顶点与片段着色器
 ├── assets/meshes/         # 内置的测试网格 (Cube, Sphere, Torus 等)
-└── third_party/
-    └── glad_gl33/         # 预生成的 GLAD (OpenGL 3.3 Core) 源码
 ```
 
 ---

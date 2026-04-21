@@ -78,16 +78,16 @@ public:
         }
     }
 
-    bool setSourceMesh(const ObjData& obj) {
+    bool setSourceMesh(const MeshModel& obj) {
         m_srcObj = obj;
         m_srcTranslation = {0.0, 0.0, 0.0};
-        return obj.valid;
+        return obj.isValid();
     }
 
-    bool setCutMesh(const ObjData& obj) {
+    bool setCutMesh(const MeshModel& obj) {
         m_cutObj = obj;
         m_cutTranslation = {0.0, 0.0, 0.0};
-        return obj.valid;
+        return obj.isValid();
     }
 
     /**
@@ -108,8 +108,8 @@ public:
     std::array<double,3> getSourceTranslation() const { return m_srcTranslation; }
     std::array<double,3> getCutTranslation()    const { return m_cutTranslation; }
 
-    const ObjData& getSourceObj() const { return m_srcObj; }
-    const ObjData& getCutObj()    const { return m_cutObj; }
+    const MeshModel& getSourceObj() const { return m_srcObj; }
+    const MeshModel& getCutObj()    const { return m_cutObj; }
 
     /**
      * @brief Execute the specified boolean operation.
@@ -120,7 +120,7 @@ public:
             statusMessage = "MCUT context not initialized.";
             return false;
         }
-        if (!m_srcObj.valid || !m_cutObj.valid) {
+        if (!m_srcObj.isValid() || !m_cutObj.isValid()) {
             statusMessage = "Source or cut mesh not loaded.";
             return false;
         }
@@ -137,7 +137,7 @@ public:
         log("Dispatching MCUT (" + std::string(BoolOpNames[(int)opType]) + ")...");
 
         // Apply translation offsets to vertex arrays (copy to avoid modifying originals)
-        std::vector<double> srcVerts = m_srcObj.vertices;
+        std::vector<double> srcVerts = m_srcObj.data.vertices;
         if (m_srcTranslation[0] != 0.0 || m_srcTranslation[1] != 0.0 || m_srcTranslation[2] != 0.0) {
             for (size_t v = 0; v < srcVerts.size(); v += 3) {
                 srcVerts[v+0] += m_srcTranslation[0];
@@ -145,7 +145,7 @@ public:
                 srcVerts[v+2] += m_srcTranslation[2];
             }
         }
-        std::vector<double> cutVerts = m_cutObj.vertices;
+        std::vector<double> cutVerts = m_cutObj.data.vertices;
         if (m_cutTranslation[0] != 0.0 || m_cutTranslation[1] != 0.0 || m_cutTranslation[2] != 0.0) {
             for (size_t v = 0; v < cutVerts.size(); v += 3) {
                 cutVerts[v+0] += m_cutTranslation[0];
@@ -160,15 +160,15 @@ public:
             m_context,
             flags,
             srcVerts.data(),
-            m_srcObj.faceIndices.data(),
-            m_srcObj.faceSizes.data(),
+            m_srcObj.data.indices.data(),
+            m_srcObj.data.sizes.data(),
             (uint32_t)(srcVerts.size() / 3),
-            (uint32_t)m_srcObj.faceSizes.size(),
+            (uint32_t)m_srcObj.data.sizes.size(),
             cutVerts.data(),
-            m_cutObj.faceIndices.data(),
-            m_cutObj.faceSizes.data(),
+            m_cutObj.data.indices.data(),
+            m_cutObj.data.sizes.data(),
             (uint32_t)(cutVerts.size() / 3),
-            (uint32_t)m_cutObj.faceSizes.size());
+            (uint32_t)m_cutObj.data.sizes.size());
 
         auto t1 = std::chrono::high_resolution_clock::now();
         lastDispatchTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -212,8 +212,8 @@ public:
 
 private:
     McContext m_context = MC_NULL_HANDLE;
-    ObjData   m_srcObj;
-    ObjData   m_cutObj;
+    MeshModel   m_srcObj;
+    MeshModel   m_cutObj;
     std::array<double,3> m_srcTranslation = {0.0, 0.0, 0.0};
     std::array<double,3> m_cutTranslation = {0.0, 0.0, 0.0};
 

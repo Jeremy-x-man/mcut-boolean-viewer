@@ -10,6 +10,9 @@
 #include <cstdio>
 #include "RenderMesh.h"
 
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "tinyobj/tiny_obj_loader.h"
+
 // Cross-platform sscanf: MSVC provides sscanf_s as the "safe" variant.
 // We alias it here so the rest of the code uses a single name.
 #ifdef _MSC_VER
@@ -24,19 +27,120 @@
  * Supports triangulated and quad faces. Returns raw vertex/index arrays
  * suitable for both rendering (RenderMesh) and MCUT dispatch.
  */
-struct ObjData {
-    std::vector<double>   vertices;   ///< flat array: x,y,z per vertex
-    std::vector<uint32_t> faceIndices;///< flat array of vertex indices
-    std::vector<uint32_t> faceSizes;  ///< number of vertices per face
-    bool valid = false;
+struct MeshData {
+    std::vector<double>   vertices;     ///< flat array: x,y,z per vertex
+    std::vector<uint32_t> indices;      ///< flat array of vertex indices
+    std::vector<uint32_t> sizes;        ///< number of vertices per face
+
+    bool isValid() const {
+		return !vertices.empty() && !indices.empty() && !sizes.empty();
+    }
 };
 
-inline ObjData loadOBJ(const std::string& path) {
-    ObjData data;
+// mesh section for multi-material meshes, stores index/vertex ranges for each section
+struct MeshSection {
+    /** The offset of this section's indices in the MeshData's faceIndices */
+    uint32_t baseIndex;
+    /** The number of faces in this section. */
+    uint32_t numFaces;
+};
+
+// store mesh data and sections (for multi-material meshes)
+struct MeshModel {
+    bool isValid() const {
+        return data.isValid();
+    }
+    uint32_t numFaces() const {
+        return (uint32_t)data.sizes.size();
+	}
+    uint32_t numVertices() const {
+        return (uint32_t)(data.vertices.size() / 3);
+	}
+    MeshData data;
+    std::vector<MeshSection> sections;
+
+    std::vector<MeshData GetTransformedVertices(std::array<double, 3> transform) const {
+        if (sections.size() > 1) {
+            std::vector<double> outVerts(data.vertices);
+            if (transform[0] != 0.0 || transform[1] != 0.0 || transform[2] != 0.0) {
+                for (size_t v = 0; v < outVerts.size(); v += 3) {
+                    outVerts[v + 0] += transform[0];
+                    outVerts[v + 1] += transform[1];
+                    outVerts[v + 2] += transform[2];
+                }
+            }
+			return { std::move(outVerts), data.indices, data.sizes };
+        }
+        else {
+            std::vector<double> outVerts(data.vertices);
+            if (transform[0] != 0.0 || transform[1] != 0.0 || transform[2] != 0.0) {
+                for (size_t v = 0; v < outVerts.size(); v += 3) {
+                    outVerts[v + 0] += transform[0];
+                    outVerts[v + 1] += transform[1];
+                    outVerts[v + 2] += transform[2];
+                }
+            }
+        }
+	}
+};
+
+inline bool loadOBJModel(const std::string& path, MeshModel& mesh) {
+    // 1. 定义存储模型数据的容器
+    tinyobj::attrib_t attrib;               // 存储顶点、法线、纹理坐标等属性
+    std::vector<tinyobj::shape_t> shapes;   // 存储模型的形状（网格）
+    std::vector<tinyobj::material_t> materials; // 存储材质信息
+    std::string err;                        // 用于错误信息
+
+    // 2. 加载 OBJ 文件
+    // 参数：文件路径, 属性容器, 形状容器, 材质容器, 警告信息, 错误信息, 是否 triangulate
+    bool ret = tinyobj::LoadObj (&attrib, &shapes, &materials, &err, path.c_str());
+    if (!err.empty()) {
+        if (err.find("ERROR:") != std::string::npos || err.find("Error:") != std::string::npos)
+        {
+            std::cerr << "加载错误: " << err << std::endl;
+            return false;// 加载失败，退出程序
+        }
+        else
+        {
+            std::cerr << "加载告警: " << err << std::endl;
+        }
+    }
+
+    if (!ret) {
+        std::cerr << "无法加载 OBJ 文件" << std::endl;
+        return false;
+    }
+
+    // 3. 遍历并处理加载的模型数据
+    std::cout << "成功加载 " << shapes.size() << " 个形状。" << std::endl;
+
+    mesh.data.vertices.resize(attrib.vertices.size());
+    for (size_t s = 0; s < attrib.vertices.size(); s++) {
+        mesh.data.vertices[s] = (double)attrib.vertices[s];
+    }
+
+    // Loop over shapes
+    mesh.sections.resize(shapes.size());
+    for (size_t s = 0; s < shapes.size(); s++) {
+        // Loop over faces(polygon)
+        mesh.sections[s].baseIndex = (uint32_t)mesh.data.indices.size();
+        mesh.sections[s].numFaces = (uint32_t)shapes[s].mesh.indices.size() / 3;
+
+        for (size_t i = 0; i < shapes[s].mesh.indices.size(); i++) {
+            mesh.data.indices.push_back((uint32_t)shapes[s].mesh.indices[i].vertex_index);
+        }
+        for (size_t f = 0; f < shapes[s].mesh.num_face_vertices.size(); f++) {
+            mesh.data.sizes.push_back((uint32_t)shapes[s].mesh.num_face_vertices[f]);
+        }
+    }
+    return true;
+}
+
+inline bool loadOBJ(const std::string& path, MeshModel& Mesh) {
     std::ifstream file(path);
     if (!file.is_open()) {
         std::cerr << "[ObjLoader] Cannot open: " << path << "\n";
-        return data;
+        return false;
     }
 
     std::vector<glm::vec3> positions;
@@ -52,9 +156,9 @@ inline ObjData loadOBJ(const std::string& path) {
             float x, y, z;
             ss >> x >> y >> z;
             positions.push_back({x, y, z});
-            data.vertices.push_back((double)x);
-            data.vertices.push_back((double)y);
-            data.vertices.push_back((double)z);
+            Mesh.data.vertices.push_back((double)x);
+            Mesh.data.vertices.push_back((double)y);
+            Mesh.data.vertices.push_back((double)z);
         } else if (token == "f") {
             std::vector<uint32_t> faceVerts;
             std::string vtok;
@@ -66,22 +170,19 @@ inline ObjData loadOBJ(const std::string& path) {
                 faceVerts.push_back((uint32_t)(vi - 1));
             }
             if (faceVerts.size() >= 3) {
-                data.faceSizes.push_back((uint32_t)faceVerts.size());
-                for (auto idx : faceVerts) data.faceIndices.push_back(idx);
+                Mesh.data.sizes.push_back((uint32_t)faceVerts.size());
+                for (auto idx : faceVerts) Mesh.data.indices.push_back(idx);
             }
         }
     }
-
-    data.valid = !positions.empty() && !data.faceSizes.empty();
-    return data;
+    return Mesh.isValid();
 }
 
-inline ObjData loadOFF(const std::string& path) {
-    ObjData data;
+inline bool loadOFF(const std::string& path, MeshModel& Mesh) {
     std::ifstream file(path);
     if (!file.is_open()) {
         std::cerr << "[ObjLoader] Cannot open: " << path << "\n";
-        return data;
+        return false;
     }
     auto next_line = [&](std::ifstream& f, std::string& s) -> bool {
         while (getline(f, s)) {
@@ -91,25 +192,21 @@ inline ObjData loadOFF(const std::string& path) {
         }
         return false;
         };
-    //
     // file header
-    //
     std::string header;
     if (!next_line(file, header)) {
         printf("error: .off file header not found\n");
-        return data;
+        return false;
     }
     if (header != "OFF") {
         printf("error: unrecognised .off file header\n");
-        return data;
+        return false;
     }
-    //
     // #vertices, #faces, #edges
-    //
     std::string info;
     if (!next_line(file, info)) {
         printf("error: .off element count not found\n");
-        return data;
+        return false;
     }
     std::istringstream info_stream;
     info_stream.str(info);
@@ -127,7 +224,7 @@ inline ObjData loadOFF(const std::string& path) {
     for (int i = 0; i < nvertices; ++i) {
         if (!next_line(file, info)) {
             printf("error: .off vertex not found\n");
-            return data;
+            return false;
         }
         std::istringstream vtx_line_stream(info);
 
@@ -136,17 +233,15 @@ inline ObjData loadOFF(const std::string& path) {
         double z;
         vtx_line_stream >> x >> y >> z;
         positions.push_back({ x, y, z });
-        data.vertices.push_back((double)x);
-        data.vertices.push_back((double)y);
-        data.vertices.push_back((double)z);
+        Mesh.data.vertices.push_back((double)x);
+        Mesh.data.vertices.push_back((double)y);
+        Mesh.data.vertices.push_back((double)z);
     }
-    //
     // faces
-    //
     for (auto i = 0; i < nfaces; ++i) {
         if (!next_line(file, info)) {
             printf("error: .off file face not found\n");
-            return data;
+            return false;
         }
         std::istringstream face_line_stream(info);
         int n; // number of vertices in face
@@ -155,59 +250,58 @@ inline ObjData loadOFF(const std::string& path) {
 
         if (n < 3) {
             printf("error: invalid polygon vertex count in file (%d)\n", n);
-            return data;
+            return false;
         }
         for (int j = 0; j < n; ++j) {
             face_line_stream >> index;
-            data.faceIndices.push_back(index);
+            Mesh.data.indices.push_back(index);
         }
-        data.faceSizes.push_back(n);
+        Mesh.data.sizes.push_back(n);
     }
-    data.valid = !data.vertices.empty() && !data.faceSizes.empty();
-    return data;
+    return Mesh.isValid();
 }
 
-inline ObjData loadMesh(const std::string& path) {
+inline bool loadMesh(const std::string& path, MeshModel& Mesh) {
     if (path.find(".obj") != std::string::npos || path.find(".OBJ") != std::string::npos) {
-        return loadOBJ(path);
+        return loadOBJModel(path, Mesh);
     }
     else if (path.find(".off") != std::string::npos || path.find(".OFF") != std::string::npos) {
-        return loadOFF(path);
+        return loadOFF(path, Mesh);
     }
     else {
         std::cerr << "[ObjLoader] Unsupported file format: " << path << "\n";
-        return ObjData();
+        return false;
     }
 }
 
 /**
- * @brief Convert ObjData to a RenderMesh (triangulated, with flat normals).
+ * @brief Convert MeshData to a RenderMesh (triangulated, with flat normals).
  */
-inline std::unique_ptr<RenderMesh> objDataToRenderMesh(const ObjData& obj, const std::string& label = "") {
+inline std::unique_ptr<RenderMesh> meshModelToRenderMesh(const MeshData& data, const std::string& label = "") {
     auto mesh = std::make_unique<RenderMesh>();
     mesh->label = label;
 
     // Copy positions as vertices
-    size_t numVerts = obj.vertices.size() / 3;
+    size_t numVerts = data.vertices.size() / 3;
     mesh->vertices.resize(numVerts);
     for (size_t i = 0; i < numVerts; ++i) {
         mesh->vertices[i].position = {
-            (float)obj.vertices[i*3+0],
-            (float)obj.vertices[i*3+1],
-            (float)obj.vertices[i*3+2]
+            (float)data.vertices[i*3+0],
+            (float)data.vertices[i*3+1],
+            (float)data.vertices[i*3+2]
         };
         mesh->vertices[i].normal = glm::vec3(0.0f);
     }
 
     // Triangulate faces (fan triangulation)
     size_t faceOffset = 0;
-    for (size_t f = 0; f < obj.faceSizes.size(); ++f) {
-        uint32_t fsize = obj.faceSizes[f];
-        uint32_t v0 = obj.faceIndices[faceOffset];
+    for (size_t f = 0; f < data.sizes.size(); ++f) {
+        uint32_t fsize = data.sizes[f];
+        uint32_t v0 = data.indices[faceOffset];
         for (uint32_t k = 1; k + 1 < fsize; ++k) {
             mesh->indices.push_back(v0);
-            mesh->indices.push_back(obj.faceIndices[faceOffset + k]);
-            mesh->indices.push_back(obj.faceIndices[faceOffset + k + 1]);
+            mesh->indices.push_back(data.indices[faceOffset + k]);
+            mesh->indices.push_back(data.indices[faceOffset + k + 1]);
         }
         faceOffset += fsize;
     }
