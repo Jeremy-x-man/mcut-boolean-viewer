@@ -34,6 +34,9 @@
 #include "BooleanOp.h"
 #include "Camera.h"
 #include "Shader.h"
+#include "SlicerEngine.h"
+#include "GcodeExporter.h"
+#include "SlicerRenderer.h"
 
 #include <string>
 #include <vector>
@@ -60,7 +63,7 @@ struct CCSnapshot {
 
 struct AppSnapshot {
     std::string   srcPath, cutPath;
-    MeshModel     srcObj, cutObj;
+    ObjData       srcObj,  cutObj;
     glm::vec3     srcTranslation{0.0f}, cutTranslation{0.0f};
     int           opType = 0;
     double        dispatchTimeMs = 0.0;
@@ -173,6 +176,30 @@ static bool   g_needsBooleanUpdate = false;
 
 // Shader
 static Shader g_shader;
+
+// ============================================================
+//  Slicer global state
+// ============================================================
+static SlicerEngine    g_slicer;
+static SlicerRenderer  g_slicerRenderer;
+static SliceResult     g_sliceResult;
+static SlicerParams    g_sliceParams;
+static bool            g_sliceRunning    = false;
+static bool            g_sliceDone       = false;
+static bool            g_showSliceOverlay = false;   // show slice paths in 3D view
+static bool            g_showGcodeView   = false;    // show parsed G-code paths
+static int             g_sliceLayerCur   = 0;        // currently previewed layer
+static int             g_sliceLayerMin   = 0;        // 3D display range min
+static int             g_sliceLayerMax   = 9999;     // 3D display range max
+static char            g_gcodeExportPath[512] = "output.gcode";
+static float           g_sliceProgress   = 0.0f;
+static std::string     g_sliceStatusMsg;
+// G-code string (in-memory)
+static std::string     g_gcodeStr;
+static std::vector<GcodeExporter::GcodeMove> g_gcodeMoves;
+
+// Auto-demo: force Slicer Tab selection
+static bool            g_forceSlicerTab = false;  // set to true to force-select Slicer tab
 
 // ============================================================
 //  Inline GLSL
@@ -387,16 +414,16 @@ static void restoreSnapshot(const AppSnapshot& snap) {
     g_selectedOp     = snap.opType;
 
     // Restore source mesh GPU
-    if (snap.srcObj.isValid()) {
+    if (snap.srcObj.valid) {
         g_boolMgr.setSourceMesh(snap.srcObj);
-        g_srcMesh = meshModelToRenderMesh(snap.srcObj.data, "Source (A)");
+        g_srcMesh = objDataToRenderMesh(snap.srcObj, "Source (A)");
         g_srcMesh->color = {0.25f, 0.55f, 1.0f};
         g_srcMesh->alpha = g_srcAlpha;
     }
     // Restore cut mesh GPU
-    if (snap.cutObj.isValid()) {
+    if (snap.cutObj.valid) {
         g_boolMgr.setCutMesh(snap.cutObj);
-        g_cutMesh = meshModelToRenderMesh(snap.cutObj.data, "Cut (B)");
+        g_cutMesh = objDataToRenderMesh(snap.cutObj, "Cut (B)");
         g_cutMesh->color = {1.0f, 0.45f, 0.15f};
         g_cutMesh->alpha = g_cutAlpha;
     }
@@ -525,36 +552,30 @@ static void renderThumbs() {
 //  Load mesh helpers
 // ============================================================
 static bool loadSrcMesh(const std::string& path) {
-    MeshModel obj;
-    if(!loadMesh(path, obj)){
-        addLog("ERROR: Cannot load source mesh: " + path);
-        return false;
-	}
+    ObjData obj = loadOBJ(path);
+    if (!obj.valid) { addLog("ERROR: Cannot load source mesh: " + path); return false; }
     g_boolMgr.setSourceMesh(obj);
-    g_srcMesh = meshModelToRenderMesh(obj.data, "Source (A)");
+    g_srcMesh = objDataToRenderMesh(obj, "Source (A)");
     g_srcMesh->color = {0.25f, 0.55f, 1.0f};
     g_srcMesh->alpha = g_srcAlpha;
     g_srcTranslation = glm::vec3(0.0f);
     addLog("Loaded A: " + path
-         + " (" + std::to_string(obj.numVertices()) + " verts, "
-         + std::to_string(obj.numFaces()) + " faces)");
+         + " (" + std::to_string(obj.vertices.size()/3) + " verts, "
+         + std::to_string(obj.faceSizes.size()) + " faces)");
     return true;
 }
 
 static bool loadCutMesh(const std::string& path) {
-    MeshModel obj;
-    if (!loadMesh(path, obj)) {
-        addLog("ERROR: Cannot load source mesh: " + path);
-        return false;
-    }
+    ObjData obj = loadOBJ(path);
+    if (!obj.valid) { addLog("ERROR: Cannot load cut mesh: " + path); return false; }
     g_boolMgr.setCutMesh(obj);
-    g_cutMesh = meshModelToRenderMesh(obj.data, "Cut (B)");
+    g_cutMesh = objDataToRenderMesh(obj, "Cut (B)");
     g_cutMesh->color = {1.0f, 0.45f, 0.15f};
     g_cutMesh->alpha = g_cutAlpha;
     g_cutTranslation = glm::vec3(0.0f);
     addLog("Loaded B: " + path
-         + " (" + std::to_string(obj.numVertices()) + " verts, "
-         + std::to_string(obj.numFaces()) + " faces)");
+         + " (" + std::to_string(obj.vertices.size()/3) + " verts, "
+         + std::to_string(obj.faceSizes.size()) + " faces)");
     return true;
 }
 
@@ -582,6 +603,217 @@ static void exportResults() {
     }
     addLog("Exported " + std::to_string(count) + " mesh(es) to: " + std::string(g_exportDir) + "/");
     g_exportMsgTimer = 3.0f;
+}
+
+// ============================================================
+//  Run slicer
+// ============================================================
+// Collect all result mesh vertices/indices into a single flat mesh for slicing
+static void buildSliceMesh(std::vector<float>& verts, std::vector<uint32_t>& inds) {
+    verts.clear(); inds.clear();
+    uint32_t base = 0;
+    // Use result meshes if available, otherwise use source mesh
+    bool useResult = g_boolMgr.hasResult && !g_boolMgr.resultMeshes.empty();
+    if (useResult) {
+        for (const auto& rm : g_boolMgr.resultMeshes) {
+            if (!rm || !rm->visible) continue;
+            for (const auto& v : rm->vertices) {
+                verts.push_back(v.position.x);
+                verts.push_back(v.position.y);
+                verts.push_back(v.position.z);
+            }
+            for (auto idx : rm->indices) inds.push_back(base + idx);
+            base += (uint32_t)rm->vertices.size();
+        }
+    } else if (g_srcMesh) {
+        for (const auto& v : g_srcMesh->vertices) {
+            verts.push_back(v.position.x + g_srcTranslation.x);
+            verts.push_back(v.position.y + g_srcTranslation.y);
+            verts.push_back(v.position.z + g_srcTranslation.z);
+        }
+        for (auto idx : g_srcMesh->indices) inds.push_back(idx);
+    }
+}
+
+static void runSlicer() {
+    std::vector<float>    verts;
+    std::vector<uint32_t> inds;
+    buildSliceMesh(verts, inds);
+    if (verts.empty()) { addLog("ERROR: No mesh to slice."); return; }
+
+    addLog("--- Slicing mesh (" + std::to_string(verts.size()/3) + " verts, "
+         + std::to_string(inds.size()/3) + " tris) ---");
+
+    g_sliceRunning = true;
+    g_sliceDone    = false;
+    g_sliceProgress = 0.0f;
+
+    g_sliceResult = g_slicer.slice(verts, inds, g_sliceParams,
+        [](int cur, int total, const std::string&) {
+            g_sliceProgress = (total > 0) ? (float)cur / total : 0.0f;
+        });
+
+    g_sliceRunning  = false;
+    g_sliceDone     = g_sliceResult.success;
+    g_sliceStatusMsg = g_sliceResult.statusMsg;
+    addLog("Slice: " + g_sliceResult.statusMsg);
+
+    if (g_sliceResult.success) {
+        g_sliceLayerCur = 0;
+        g_sliceLayerMin = 0;
+        g_sliceLayerMax = (int)g_sliceResult.layers.size() - 1;
+        g_slicerRenderer.displayLayerMin = g_sliceLayerMin;
+        g_slicerRenderer.displayLayerMax = g_sliceLayerMax;
+        g_slicerRenderer.buildFromResult(g_sliceResult);
+        // Generate G-code
+        g_gcodeStr   = GcodeExporter::exportToString(g_sliceResult);
+        g_gcodeMoves = GcodeExporter::parseForVisualization(g_gcodeStr);
+        addLog("G-code: " + std::to_string(g_gcodeStr.size()/1024) + " KB, "
+             + std::to_string(g_gcodeMoves.size()) + " moves");
+    }
+}
+
+// ============================================================
+//  Slicer tab content (embedded inside right panel TabBar)
+// ============================================================
+static void renderSlicerTabContent() {
+
+    ImGui::SeparatorText("Printer Parameters");
+
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Layer Height (mm)",      &g_sliceParams.layerHeight,      0.05f, 0.1f, "%.2f");
+    g_sliceParams.layerHeight = std::max(0.05f, std::min(1.0f, g_sliceParams.layerHeight));
+
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Nozzle Dia. (mm)",        &g_sliceParams.nozzleDiameter,   0.1f, 0.2f, "%.2f");
+    g_sliceParams.nozzleDiameter = std::max(0.1f, std::min(2.0f, g_sliceParams.nozzleDiameter));
+
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("Shells",                   &g_sliceParams.numShells,        1, 5);
+
+    ImGui::SetNextItemWidth(110);
+    float infillPct = g_sliceParams.infillDensity * 100.0f;
+    if (ImGui::SliderFloat("Infill %%",          &infillPct, 0.0f, 100.0f, "%.0f%%"))
+        g_sliceParams.infillDensity = infillPct / 100.0f;
+
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("Top Layers",               &g_sliceParams.topLayers,        0, 10);
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("Bottom Layers",            &g_sliceParams.bottomLayers,     0, 10);
+
+    ImGui::Checkbox("Honeycomb Infill",          &g_sliceParams.useHoneycomb);
+
+    ImGui::SeparatorText("Print Speed");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Print (mm/s)",            &g_sliceParams.printSpeed,       5.0f, 10.0f, "%.0f");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Travel (mm/s)",           &g_sliceParams.travelSpeed,      5.0f, 10.0f, "%.0f");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Infill (mm/s)",           &g_sliceParams.infillSpeed,      5.0f, 10.0f, "%.0f");
+
+    ImGui::SeparatorText("Temperature");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Extruder (°C)",           &g_sliceParams.extruderTemp,     5.0f, 10.0f, "%.0f");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Bed (°C)",                &g_sliceParams.bedTemp,          5.0f, 10.0f, "%.0f");
+
+    ImGui::SeparatorText("Filament");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Diameter (mm)",           &g_sliceParams.filamentDiameter, 0.1f, 0.5f, "%.2f");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Retraction (mm)",         &g_sliceParams.retractionLength, 0.1f, 0.5f, "%.1f");
+
+    ImGui::Spacing();
+    // Slice button
+    ImGui::PushStyleColor(ImGuiCol_Button,        {0.15f, 0.60f, 0.25f, 1.0f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.25f, 0.80f, 0.35f, 1.0f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.10f, 0.45f, 0.18f, 1.0f});
+    if (ImGui::Button("  Slice Mesh  ", {-1, 30})) runSlicer();
+    ImGui::PopStyleColor(3);
+
+    if (g_sliceRunning) {
+        ImGui::ProgressBar(g_sliceProgress, {-1, 0}, "Slicing...");
+    }
+    if (!g_sliceStatusMsg.empty()) {
+        bool ok = g_sliceResult.success;
+        ImGui::TextColored(ok ? ImVec4{0.4f,1.0f,0.4f,1.0f} : ImVec4{1.0f,0.4f,0.4f,1.0f},
+                           "%s", g_sliceStatusMsg.c_str());
+    }
+
+    // ---- Results ----
+    if (g_sliceDone && g_sliceResult.success) {
+        ImGui::SeparatorText("Slice Result");
+        ImGui::Text("Layers : %d", (int)g_sliceResult.layers.size());
+        ImGui::Text("Est.Time: %dm %ds",
+            (int)(g_sliceResult.estimatedTime/60),
+            (int)g_sliceResult.estimatedTime%60);
+        ImGui::Text("Filament: %.1f mm", g_sliceResult.estimatedFilament);
+
+        ImGui::Spacing();
+        // 3D overlay toggle
+        ImGui::Checkbox("Show Slice Paths (3D)", &g_showSliceOverlay);
+        ImGui::SameLine();
+        ImGui::Checkbox("G-code Paths",          &g_showGcodeView);
+
+        // Visibility toggles for slice renderer
+        ImGui::Checkbox("Contours",  &g_slicerRenderer.showContours);
+        ImGui::SameLine();
+        ImGui::Checkbox("Shells",    &g_slicerRenderer.showShells);
+        ImGui::SameLine();
+        ImGui::Checkbox("Infill",    &g_slicerRenderer.showInfill);
+        ImGui::SameLine();
+        ImGui::Checkbox("Solid",     &g_slicerRenderer.showSolid);
+        ImGui::SameLine();
+        ImGui::Checkbox("Travel",    &g_slicerRenderer.showTravel);
+
+        // Layer range slider for 3D display
+        int totalL = (int)g_sliceResult.layers.size();
+        ImGui::SeparatorText("Layer Range (3D)");
+        ImGui::SetNextItemWidth(-1);
+        bool rangeChanged = false;
+        rangeChanged |= ImGui::SliderInt("Min##lr", &g_sliceLayerMin, 0, totalL-1);
+        rangeChanged |= ImGui::SliderInt("Max##lr", &g_sliceLayerMax, 0, totalL-1);
+        if (g_sliceLayerMin > g_sliceLayerMax) std::swap(g_sliceLayerMin, g_sliceLayerMax);
+        if (rangeChanged) {
+            g_slicerRenderer.displayLayerMin = g_sliceLayerMin;
+            g_slicerRenderer.displayLayerMax = g_sliceLayerMax;
+        }
+
+        // Layer thumbnail preview
+        ImGui::SeparatorText("Layer Preview");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderInt("Layer##cur", &g_sliceLayerCur, 0, totalL-1);
+        g_sliceLayerCur = std::max(0, std::min(totalL-1, g_sliceLayerCur));
+
+        // Render and show the selected layer thumbnail
+        GLuint thumbTex = g_slicerRenderer.renderLayerThumb(g_sliceLayerCur);
+        if (thumbTex) {
+            float avail = ImGui::GetContentRegionAvail().x;
+            float sz    = std::min(avail, 256.0f);
+            ImGui::Image((ImTextureID)(intptr_t)thumbTex, {sz, sz},
+                         {0, 1}, {1, 0});  // flip Y
+            const auto& layer = g_sliceResult.layers[g_sliceLayerCur];
+            ImGui::TextDisabled("z=%.3f mm  contours=%zu  shells=%zu  infill=%zu",
+                layer.z,
+                layer.contours.size(),
+                layer.shells.empty() ? 0 : layer.shells[0].size(),
+                layer.infillPaths.size() + layer.solidPaths.size());
+        }
+
+        // G-code export
+        ImGui::SeparatorText("Export G-code");
+        ImGui::SetNextItemWidth(180);
+        ImGui::InputText("##gcpath", g_gcodeExportPath, sizeof(g_gcodeExportPath));
+        ImGui::SameLine();
+        if (ImGui::Button("Export")) {
+            if (GcodeExporter::exportToFile(g_sliceResult, g_gcodeExportPath)) {
+                addLog("G-code exported: " + std::string(g_gcodeExportPath)
+                     + " (" + std::to_string(g_gcodeStr.size()/1024) + " KB)");
+            } else {
+                addLog("ERROR: Cannot write " + std::string(g_gcodeExportPath));
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -708,22 +940,24 @@ static void keyCallback(GLFWwindow* window, int key, int /*scancode*/, int actio
 }
 
 // ============================================================
-//  Right-side preview panel (CC thumbnails)
+//  Right-side preview panel (TabBar: Results | Slicer)
 // ============================================================
 static void renderPreviewPanel() {
-    // Panel width
-    static const float kPanelW = g_viewportW / 3;
+    static const float kPanelW = 300.0f;
     ImGui::SetNextWindowPos({(float)g_viewportW - kPanelW, 0}, ImGuiCond_Always);
     ImGui::SetNextWindowSize({kPanelW, (float)g_viewportH}, ImGuiCond_Always);
-    ImGui::Begin("Result Preview", nullptr,
+    ImGui::Begin("Preview", nullptr,
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+
+    if (ImGui::BeginTabBar("RightTabs")) {
+
+    // ---- Tab: Results ----
+    if (ImGui::BeginTabItem("Results")) {
 
     if (!g_boolMgr.hasResult || g_boolMgr.resultMeshes.empty()) {
         ImGui::TextDisabled("No result yet.");
         ImGui::TextWrapped("Execute a boolean operation to see the result components here.");
-        ImGui::End();
-        return;
-    }
+    } else {
 
     ImGui::Text("Components: %zu", g_boolMgr.resultMeshes.size());
     ImGui::SameLine();
@@ -732,11 +966,11 @@ static void renderPreviewPanel() {
     ImGui::Separator();
 
     // Scrollable area for thumbnails
-    ImGui::BeginChild("ThumbScroll", {0, 0}, false, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::BeginChild("ThumbScroll", {0, -1}, false, ImGuiWindowFlags_HorizontalScrollbar);
 
     float availW = ImGui::GetContentRegionAvail().x;
     // Fit thumb size to panel width (at most kThumbW)
-    float thumbDisp = std::min(availW - 8.0f, std::max((float)kThumbW, kPanelW));
+    float thumbDisp = std::min(availW - 8.0f, (float)kThumbW);
 
     for (size_t i = 0; i < g_boolMgr.resultMeshes.size() && i < g_thumbs.size(); ++i) {
         auto& rm = g_boolMgr.resultMeshes[i];
@@ -809,7 +1043,26 @@ static void renderPreviewPanel() {
         ImGui::PopID();
     }
 
-    ImGui::EndChild();
+    ImGui::EndChild();  // ThumbScroll
+    } // end else (has result)
+    ImGui::EndTabItem(); // Results
+    } // end if BeginTabItem("Results")
+
+    // ---- Tab: Slicer ----
+    ImGuiTabItemFlags slicerTabFlags = 0;
+    if (g_forceSlicerTab) {
+        slicerTabFlags = ImGuiTabItemFlags_SetSelected;
+        g_forceSlicerTab = false;  // reset after one frame
+    }
+    if (ImGui::BeginTabItem("Slicer", nullptr, slicerTabFlags)) {
+        ImGui::BeginChild("SlicerScroll", {0, -1}, false);
+        renderSlicerTabContent();
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+
+    } // end if BeginTabBar
+    ImGui::EndTabBar();
     ImGui::End();
 }
 
@@ -817,8 +1070,8 @@ static void renderPreviewPanel() {
 //  Left-side control panel
 // ============================================================
 static void renderControlPanel(float dt) {
-    static const float kPanelW = g_viewportW / 3;
-    static const float kPreviewW = kPanelW;  // right panel width
+    static const float kPanelW = 300.0f;
+    static const float kPreviewW = 300.0f;  // right panel width
     float mainW = (float)g_viewportW - kPanelW - kPreviewW;
     (void)mainW;
 
@@ -1106,6 +1359,9 @@ int main(int /*argc*/, char** /*argv*/) {
     buildGrid(8.0f, 32);
     g_camera.setAspectRatio((float)g_viewportW / g_viewportH);
 
+    // Init slicer renderer (needs OpenGL context)
+    g_slicerRenderer.init();
+
     g_boolMgr.logCallback = addLog;
     if (!g_boolMgr.init()) {
         addLog("ERROR: Failed to initialize MCUT context!");
@@ -1121,12 +1377,38 @@ int main(int /*argc*/, char** /*argv*/) {
     //  Main loop
     // ============================================================
     double lastTime = glfwGetTime();
+    int autoRunFrame = 0;  // auto-execute boolean on frame 3 for demo
+    int autoSliceFrame = 0; // auto-execute slicer after boolean (0=waiting, >0=counting, -1=done)
     while (!glfwWindowShouldClose(window)) {
         double now = glfwGetTime();
         float dt = (float)(now - lastTime);
         lastTime = now;
 
         glfwPollEvents();
+
+        // Auto-run boolean on startup for demo/screenshot
+        if (autoRunFrame >= 0) {
+            autoRunFrame++;
+            if (autoRunFrame == 3 && g_boolMgr.isContextValid() && g_srcMesh && g_cutMesh) {
+                runBoolean();
+                autoRunFrame = -1;  // done
+                autoSliceFrame = 1; // start counting for auto-slice
+            }
+        }
+
+        // Auto-run slicer after boolean (for demo/screenshot)
+        if (autoSliceFrame > 0) {
+            autoSliceFrame++;
+            if (autoSliceFrame == 5) {
+                // Execute slicer on boolean result
+                runSlicer();
+                g_showSliceOverlay = true;  // show slice paths in 3D
+                g_forceSlicerTab   = true;  // force Slicer Tab selection
+            }
+            if (autoSliceFrame > 10) {
+                autoSliceFrame = -1;  // done
+            }
+        }
 
         // Deferred boolean update (after drag release)
         if (g_needsBooleanUpdate && !g_isDragging) {
@@ -1172,6 +1454,14 @@ int main(int /*argc*/, char** /*argv*/) {
         glm::vec3 viewPos = g_camera.getPosition();
 
         if (g_showGrid) drawGrid(view, proj, viewPos);
+
+        // ---- Slice / G-code overlay ----
+        if (g_sliceDone && g_sliceResult.success) {
+            if (g_showSliceOverlay)
+                g_slicerRenderer.render3D(view, proj, g_sliceLayerMin, g_sliceLayerMax);
+            if (g_showGcodeView)
+                g_slicerRenderer.renderGcode3D(view, proj, g_sliceLayerMin, g_sliceLayerMax);
+        }
 
         glm::mat4 srcModel = glm::translate(glm::mat4(1.0f), g_srcTranslation);
         glm::mat4 cutModel = glm::translate(glm::mat4(1.0f), g_cutTranslation);
@@ -1234,6 +1524,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
     // Cleanup
     destroyThumbs();
+    g_slicerRenderer.destroy();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
