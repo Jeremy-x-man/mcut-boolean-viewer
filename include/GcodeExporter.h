@@ -29,6 +29,8 @@
 #include "GcodeIR.h"
 #include "GcodeIRPasses.h"
 #include "SlicerEngine.h"
+#include "DualExtruder.h"
+#include "ToolChangePass.h"
 #include <sstream>
 #include <fstream>
 #include <iomanip>
@@ -267,6 +269,13 @@ public:
                 emitPaths(layer.infillPaths, infillSpd, lh, p.extrusionWidth, GcodeIR::GcodeFeature::Infill);
                 prog.push(GcodeIR::Instruction::featureEnd(GcodeIR::GcodeFeature::Infill));
             }
+
+            // 9. Prime tower (dual extruder — injected by DualExtruderPlanner)
+            if (!layer.primeTowerPaths.empty()) {
+                prog.push(GcodeIR::Instruction::featureBegin(GcodeIR::GcodeFeature::Purge));
+                emitPaths(layer.primeTowerPaths, 60.0f, lh, p.extrusionWidth, GcodeIR::GcodeFeature::Purge);
+                prog.push(GcodeIR::Instruction::featureEnd(GcodeIR::GcodeFeature::Purge));
+            }
         }
 
         // ---- End sequence ----
@@ -291,7 +300,11 @@ public:
     // =========================================================================
     // Stage 2: Build default post-processing pipeline from SlicerParams
     // =========================================================================
-    static GcodeIR::PostProcessPipeline buildDefaultPipeline(const SlicerParams& p)
+    // Overload with dual extruder support
+    static GcodeIR::PostProcessPipeline buildDefaultPipeline(
+        const SlicerParams& p,
+        const DualExtruderParams* dualParams = nullptr,
+        const std::vector<LayerExtruderAssignment>* assignments = nullptr)
     {
         GcodeIR::PostProcessPipeline pipe;
 
@@ -352,6 +365,21 @@ public:
         // Pass 8: Progress annotation (M73)
         pipe.addPass<GcodeIR::ProgressAnnotPass>();
 
+        // Pass 9 (optional): Tool change for dual extruder
+        // Inserted BEFORE TimingAnnotPass so timing reflects actual tool change moves.
+        // In practice we insert it at the front of the pipeline.
+        if (dualParams && dualParams->enabled && assignments) {
+            GcodeIR::ToolChangePass::Config tcCfg;
+            tcCfg.enabled    = true;
+            tcCfg.dualParams = *dualParams;
+            tcCfg.assignments= *assignments;
+            // Insert at front (before timing pass) so all downstream passes see T0/T1 context
+            pipe.insertPassFront<GcodeIR::ToolChangePass>(tcCfg);
+
+            // Extruder context propagation (after tool change)
+            pipe.insertPassAt<GcodeIR::ExtruderContextPass>(1);
+        }
+
         return pipe;
     }
 
@@ -359,7 +387,8 @@ public:
     // Convenience: full pipeline export to string
     // =========================================================================
     static std::string exportToString(const SliceResult& result,
-                                       const std::string& printerName = "Generic FDM")
+                                       const std::string& printerName = "Generic FDM",
+                                       const DualExtruderParams* dualParams = nullptr)
     {
         if (!result.success || result.layers.empty())
             return "; Empty slice result\n";
@@ -367,11 +396,20 @@ public:
         // Stage 1: Build IR
         auto prog = buildIR(result, printerName);
 
-        // Stage 2: Run post-processing pipeline
-        auto pipe = buildDefaultPipeline(result.params);
+        // Stage 2: Plan dual extruder assignments (if enabled)
+        std::vector<LayerExtruderAssignment> assignments;
+        if (dualParams && dualParams->enabled) {
+            assignments = DualExtruderPlanner::plan(result, *dualParams);
+        }
+
+        // Stage 3: Run post-processing pipeline
+        auto pipe = buildDefaultPipeline(
+            result.params,
+            (dualParams && dualParams->enabled) ? dualParams : nullptr,
+            assignments.empty() ? nullptr : &assignments);
         pipe.run(prog);
 
-        // Stage 3: Serialize
+        // Stage 4: Serialize
         GcodeIR::GcodeSerializer serializer;
         serializer.cfg.emitComments    = true;
         serializer.cfg.emitFeatureTags = true;

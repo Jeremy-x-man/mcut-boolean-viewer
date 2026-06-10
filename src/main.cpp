@@ -35,6 +35,7 @@
 #include "Camera.h"
 #include "Shader.h"
 #include "SlicerEngine.h"
+#include "DualExtruder.h"
 #include "GcodeExporter.h"
 #include "SlicerRenderer.h"
 
@@ -183,7 +184,8 @@ static Shader g_shader;
 static SlicerEngine    g_slicer;
 static SlicerRenderer  g_slicerRenderer;
 static SliceResult     g_sliceResult;
-static SlicerParams    g_sliceParams;
+static SlicerParams        g_sliceParams;
+static DualExtruderParams  g_dualParams;   // dual extruder configuration
 static bool            g_sliceRunning    = false;
 static bool            g_sliceDone       = false;
 static bool            g_showSliceOverlay = false;   // show slice paths in 3D view
@@ -666,7 +668,15 @@ static void runSlicer() {
         g_slicerRenderer.displayLayerMax = g_sliceLayerMax;
         g_slicerRenderer.buildFromResult(g_sliceResult);
         // Generate G-code
-        g_gcodeStr   = GcodeExporter::exportToString(g_sliceResult);
+        // Inject prime tower geometry if dual extruder is enabled
+        if (g_dualParams.enabled) {
+            auto assignments = DualExtruderPlanner::plan(g_sliceResult, g_dualParams);
+            DualExtruderPlanner::injectPrimeTower(g_sliceResult, g_dualParams, assignments);
+            // Rebuild renderer with prime tower paths
+            g_slicerRenderer.buildFromResult(g_sliceResult);
+        }
+        g_gcodeStr   = GcodeExporter::exportToString(g_sliceResult, "Generic FDM",
+                           g_dualParams.enabled ? &g_dualParams : nullptr);
         g_gcodeMoves = GcodeExporter::parseForVisualization(g_gcodeStr);
         addLog("G-code: " + std::to_string(g_gcodeStr.size()/1024) + " KB, "
              + std::to_string(g_gcodeMoves.size()) + " moves");
@@ -857,6 +867,109 @@ static void renderSlicerTabContent() {
         ImGui::InputFloat("Infill PA",            &g_sliceParams.paInfill, 0.005f, 0.01f, "%.3f");
     }
 
+    // ---- Dual Extruder ----
+    ImGui::SeparatorText("Dual Extruder");
+    ImGui::Checkbox("Enable Dual Extruder", &g_dualParams.enabled);
+    if (g_dualParams.enabled) {
+        // Strategy
+        ImGui::Text("Assignment Strategy:");
+        ImGui::SameLine();
+        int strat = (int)g_dualParams.strategy;
+        if (ImGui::RadioButton("ByFeature##s", strat == 0)) g_dualParams.strategy = DualAssignStrategy::ByFeature;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("ByColor##s",   strat == 1)) g_dualParams.strategy = DualAssignStrategy::ByColor;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("ByMaterial##s",strat == 2)) g_dualParams.strategy = DualAssignStrategy::ByMaterial;
+
+        // T0 parameters
+        if (ImGui::TreeNodeEx("T0 (Primary Extruder)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            auto& e0 = g_dualParams.extruders[0];
+            ImGui::SetNextItemWidth(100);
+            char mat0[32]; strncpy(mat0, e0.material.c_str(), 31); mat0[31]=0;
+            if (ImGui::InputText("Material##t0", mat0, 32)) e0.material = mat0;
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("Temp##t0", &e0.extruderTemp, 5.0f, 10.0f, "%.0f");
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("Nozzle##t0", &e0.nozzleDiameter, 0.1f, 0.2f, "%.2f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("Retract##t0", &e0.retractionLength, 0.1f, 0.5f, "%.1f");
+            ImGui::TreePop();
+        }
+
+        // T1 parameters
+        if (ImGui::TreeNodeEx("T1 (Secondary Extruder)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            auto& e1 = g_dualParams.extruders[1];
+            ImGui::SetNextItemWidth(100);
+            char mat1[32]; strncpy(mat1, e1.material.c_str(), 31); mat1[31]=0;
+            if (ImGui::InputText("Material##t1", mat1, 32)) e1.material = mat1;
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("Temp##t1", &e1.extruderTemp, 5.0f, 10.0f, "%.0f");
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("Standby##t1", &e1.standbyTemp, 5.0f, 10.0f, "%.0f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("Nozzle##t1", &e1.nozzleDiameter, 0.1f, 0.2f, "%.2f");
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("Retract##t1", &e1.retractionLength, 0.1f, 0.5f, "%.1f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputFloat("OffsetX##t1", &e1.offset.x, 1.0f, 5.0f, "%.1f");
+            ImGui::TreePop();
+        }
+
+        // Prime Tower parameters
+        if (ImGui::TreeNode("Prime Tower")) {
+            auto& pt = g_dualParams.primeTower;
+            ImGui::Checkbox("Enable Prime Tower", &pt.enabled);
+            if (pt.enabled) {
+                ImGui::SetNextItemWidth(80);
+                ImGui::InputFloat("Pos X##pt", &pt.posX, 5.0f, 10.0f, "%.1f");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80);
+                ImGui::InputFloat("Pos Y##pt", &pt.posY, 5.0f, 10.0f, "%.1f");
+                ImGui::SetNextItemWidth(80);
+                ImGui::InputFloat("Outer R##pt", &pt.outerRadius, 1.0f, 5.0f, "%.1f");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80);
+                ImGui::InputFloat("Inner R##pt", &pt.innerRadius, 1.0f, 5.0f, "%.1f");
+                ImGui::SetNextItemWidth(80);
+                ImGui::InputFloat("Purge Vol##pt", &pt.purgeVolume, 5.0f, 10.0f, "%.0f");
+                ImGui::SameLine();
+                ImGui::SliderInt("Loops##pt", &pt.loopsPerChange, 1, 5);
+            }
+            ImGui::TreePop();
+        }
+
+        // Feature assignment (ByFeature strategy)
+        if (g_dualParams.strategy == DualAssignStrategy::ByFeature) {
+            if (ImGui::TreeNode("Feature Assignment")) {
+                auto& fm = g_dualParams.featureMap;
+                auto extruderCombo = [](const char* label, ExtruderIdx& e) {
+                    int idx = (int)e;
+                    if (ImGui::Combo(label, &idx, "T0\0T1\0")) e = (ExtruderIdx)idx;
+                };
+                extruderCombo("Outer Shell##fa", fm.outerShell);
+                ImGui::SameLine();
+                extruderCombo("Inner Shell##fa", fm.innerShell);
+                extruderCombo("Infill##fa",      fm.infill);
+                ImGui::SameLine();
+                extruderCombo("Support##fa",     fm.support);
+                extruderCombo("Solid Fill##fa",  fm.solidFill);
+                ImGui::SameLine();
+                extruderCombo("Bridge##fa",      fm.bridge);
+                ImGui::TreePop();
+            }
+        }
+
+        // Tool change settings
+        ImGui::Checkbox("Standby Temp", &g_dualParams.heatStandbyExtruder);
+        ImGui::SameLine();
+        ImGui::Checkbox("Firmware Offset", &g_dualParams.applyOffsetInFirmware);
+    }
+
     ImGui::Spacing();
     // Slice button
     ImGui::PushStyleColor(ImGuiCol_Button,        {0.15f, 0.60f, 0.25f, 1.0f});
@@ -910,6 +1023,8 @@ static void renderSlicerTabContent() {
         if (ImGui::Checkbox("Skirt",     &g_slicerRenderer.showSkirt))       g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
         if (ImGui::Checkbox("Raft",      &g_slicerRenderer.showRaft))        g_slicerRenderer.markAllDirty();
+        // Row 3: dual extruder
+        if (ImGui::Checkbox("Prime Tower",&g_slicerRenderer.showPrimeTower)) g_slicerRenderer.markAllDirty();
 
         // Layer range slider for 3D display
         int totalL = (int)g_sliceResult.layers.size();
@@ -950,6 +1065,22 @@ static void renderSlicerTabContent() {
                     layer.supportPaths.size(),
                     layer.skirtLoops.size());
             }
+        }
+
+        // ---- Dual Extruder Status ----
+        if (g_dualParams.enabled) {
+            ImGui::SeparatorText("Dual Extruder Status");
+            auto& e0 = g_dualParams.extruders[0];
+            auto& e1 = g_dualParams.extruders[1];
+            ImGui::TextColored({0.9f,0.9f,0.9f,1.0f},
+                "T0: %s @ %.0f\u00b0C  |  T1: %s @ %.0f\u00b0C",
+                e0.material.c_str(), e0.extruderTemp,
+                e1.material.c_str(), e1.extruderTemp);
+            // Count tool changes
+            int tcCount = 0;
+            for (auto& layer : g_sliceResult.layers)
+                if (!layer.primeTowerPaths.empty()) ++tcCount;
+            ImGui::Text("Prime Tower Layers: %d", tcCount);
         }
 
         // G-code export

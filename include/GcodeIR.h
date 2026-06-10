@@ -114,6 +114,10 @@ enum class OpCode : uint8_t {
     SetAccel,       // M204 S<val>
     PressureAdv,    // M572 / SET_PRESSURE_ADVANCE
     FanWait,        // virtual: wait for fan to reach speed
+    ToolChange,     // Tx command (T0/T1) — resolved by ToolChangePass
+    SetExtruder,    // virtual: set active extruder context
+    PrimeTower,     // virtual: prime tower print sequence
+    ExtruderOffset, // G92 / OFFSET_EXTRUDER for nozzle offset compensation
 };
 
 // Position in 3D space (mm)
@@ -166,9 +170,16 @@ struct Instruction {
     float  accelPrint  = 0;
     float  accelTravel = 0;
 
+    // --- ToolChange fields ---
+    int    toolChangeFrom  = 0;  // extruder index switching from
+    int    toolChangeTo    = 1;  // extruder index switching to
+    float  purgeVolume     = 0;  // mm³ purge volume for prime tower
+    glm::vec2 extruderOffset = {0, 0};  // nozzle offset (X, Y) mm
+
     // --- Metadata (set by passes) ---
     float  estimatedTime = 0;   // seconds for this move (set by TimingAnnotPass)
     bool   modified = false;    // flag for passes to mark changed nodes
+    int    activeExtruder = 0;  // current active extruder (0=T0, 1=T1)
 
     // Constructors for common cases
     static Instruction moveLinear(float x, float y, float z,
@@ -279,6 +290,25 @@ struct Instruction {
         ins.pressureAdvValue = val;
         return ins;
     }
+
+    static Instruction toolChange(int from, int to, float purgeVol = 60.0f,
+                                   glm::vec2 offset = {0, 0}) {
+        Instruction ins;
+        ins.op = OpCode::ToolChange;
+        ins.toolChangeFrom   = from;
+        ins.toolChangeTo     = to;
+        ins.purgeVolume      = purgeVol;
+        ins.extruderOffset   = offset;
+        ins.activeExtruder   = to;
+        return ins;
+    }
+
+    static Instruction makeExtruderOffset(glm::vec2 offset) {
+        Instruction ins;
+        ins.op = OpCode::ExtruderOffset;
+        ins.extruderOffset = offset;
+        return ins;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -349,6 +379,27 @@ public:
             if (pass->enabled)
                 pass->run(prog);
         }
+    }
+
+    // Insert a pass at the front of the pipeline
+    template<typename T, typename... Args>
+    T* insertPassFront(Args&&... args) {
+        auto p = std::make_unique<T>(std::forward<Args>(args)...);
+        T* ptr = p.get();
+        m_passes.insert(m_passes.begin(), std::move(p));
+        return ptr;
+    }
+
+    // Insert a pass at a specific position (0-based index)
+    template<typename T, typename... Args>
+    T* insertPassAt(size_t idx, Args&&... args) {
+        auto p = std::make_unique<T>(std::forward<Args>(args)...);
+        T* ptr = p.get();
+        if (idx >= m_passes.size())
+            m_passes.push_back(std::move(p));
+        else
+            m_passes.insert(m_passes.begin() + idx, std::move(p));
+        return ptr;
     }
 
     // Get pass by name (for runtime enable/disable)

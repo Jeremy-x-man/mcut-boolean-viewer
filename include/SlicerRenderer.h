@@ -114,6 +114,9 @@ public:
     static constexpr glm::vec3 COL_RAFT           = {0.8f, 0.6f, 0.3f};    // tan/brown
     static constexpr glm::vec3 COL_BRIDGE         = {0.2f, 0.8f, 0.9f};    // teal (bridge fill)
     static constexpr glm::vec3 COL_SUPPORT_IFACE  = {1.0f, 0.5f, 0.8f};    // pink (support interface)
+    static constexpr glm::vec3 COL_PRIME_TOWER    = {1.0f, 0.8f, 0.0f};    // gold (prime tower / purge)
+    static constexpr glm::vec3 COL_T0             = {0.9f, 0.9f, 0.9f};    // T0 extruder (light gray)
+    static constexpr glm::vec3 COL_T1             = {0.3f, 0.6f, 1.0f};    // T1 extruder (blue)
 
     // ---- Visibility toggles ----
     bool showTravel        = false;
@@ -126,6 +129,7 @@ public:
     bool showRaft          = true;
     bool showBridge        = true;
     bool showSupportIface  = true;
+    bool showPrimeTower    = true;   // dual extruder prime tower
 
     // Current layer range to display in 3D view
     int  displayLayerMin = 0;
@@ -313,6 +317,7 @@ private:
             case 7: return COL_BRIDGE;
             case 8: return COL_SUPPORT_IFACE;
             case 9: return COL_INNER_SHELL;
+            case 10: return COL_PRIME_TOWER;  // prime tower / purge
             default: return COL_OUTER_SHELL;
         }
     }
@@ -383,6 +388,10 @@ private:
         // Infill
         if (showInfill)
             for (auto& path : layer.infillPaths) addPath(path, COL_INFILL);
+
+        // Prime tower (dual extruder)
+        if (showPrimeTower)
+            for (auto& path : layer.primeTowerPaths) addPath(path, COL_PRIME_TOWER);
 
         buf.upload(verts);
     }

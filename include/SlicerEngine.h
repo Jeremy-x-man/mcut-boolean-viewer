@@ -139,6 +139,13 @@ struct SliceLayer {
     std::vector<Path2> raftPaths;
     bool               isRaftLayer = false;
 
+    // Prime tower paths (injected by DualExtruderPlanner)
+    std::vector<Path2> primeTowerPaths;
+
+    // Active extruder for this layer's model paths
+    // (0 = T0, 1 = T1)
+    int activeExtruder = 0;
+
     // Bounding box
     Vec2 bbMin, bbMax;
 };
