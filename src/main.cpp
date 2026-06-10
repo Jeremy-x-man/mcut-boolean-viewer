@@ -703,6 +703,52 @@ static void renderSlicerTabContent() {
 
     ImGui::Checkbox("Honeycomb Infill",          &g_sliceParams.useHoneycomb);
 
+    // ---- Skirt ----
+    ImGui::SeparatorText("Skirt");
+    ImGui::Checkbox("Enable Skirt",              &g_sliceParams.enableSkirt);
+    if (g_sliceParams.enableSkirt) {
+        ImGui::SetNextItemWidth(110);
+        ImGui::SliderInt("Skirt Loops",           &g_sliceParams.skirtLoopCount,  1, 5);
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Skirt Dist (mm)",      &g_sliceParams.skirtDistance,   0.5f, 1.0f, "%.1f");
+        g_sliceParams.skirtDistance = std::max(0.5f, std::min(20.0f, g_sliceParams.skirtDistance));
+        ImGui::SetNextItemWidth(110);
+        ImGui::SliderInt("Skirt Layers",          &g_sliceParams.skirtLayers,     1, 5);
+    }
+
+    // ---- Raft ----
+    ImGui::SeparatorText("Raft");
+    ImGui::Checkbox("Enable Raft",               &g_sliceParams.enableRaft);
+    if (g_sliceParams.enableRaft) {
+        ImGui::SetNextItemWidth(110);
+        ImGui::SliderInt("Base Layers",           &g_sliceParams.raftBaseLayers,      1, 4);
+        ImGui::SetNextItemWidth(110);
+        ImGui::SliderInt("Interface Layers",      &g_sliceParams.raftInterfaceLayers, 1, 4);
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Margin (mm)",          &g_sliceParams.raftMargin,          0.5f, 1.0f, "%.1f");
+        g_sliceParams.raftMargin = std::max(0.5f, std::min(15.0f, g_sliceParams.raftMargin));
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Air Gap (mm)",         &g_sliceParams.raftAirGap,          0.05f, 0.1f, "%.2f");
+        g_sliceParams.raftAirGap = std::max(0.0f, std::min(1.0f, g_sliceParams.raftAirGap));
+    }
+
+    // ---- Support ----
+    ImGui::SeparatorText("Support");
+    ImGui::Checkbox("Enable Support",            &g_sliceParams.enableSupport);
+    if (g_sliceParams.enableSupport) {
+        ImGui::SetNextItemWidth(110);
+        ImGui::SliderFloat("Overhang Angle",      &g_sliceParams.supportAngle,    20.0f, 80.0f, "%.0f deg");
+        ImGui::SetNextItemWidth(110);
+        float supPct = g_sliceParams.supportDensity * 100.0f;
+        if (ImGui::SliderFloat("Support Density", &supPct, 5.0f, 50.0f, "%.0f%%"))
+            g_sliceParams.supportDensity = supPct / 100.0f;
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Offset (mm)",          &g_sliceParams.supportOffset,   0.05f, 0.1f, "%.2f");
+        g_sliceParams.supportOffset = std::max(0.0f, std::min(2.0f, g_sliceParams.supportOffset));
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Support Spd (mm/s)",   &g_sliceParams.supportSpeed,    5.0f, 10.0f, "%.0f");
+    }
+
     ImGui::SeparatorText("Print Speed");
     ImGui::SetNextItemWidth(110);
     ImGui::InputFloat("Print (mm/s)",            &g_sliceParams.printSpeed,       5.0f, 10.0f, "%.0f");
@@ -756,15 +802,22 @@ static void renderSlicerTabContent() {
         ImGui::Checkbox("G-code Paths",          &g_showGcodeView);
 
         // Visibility toggles for slice renderer
-        ImGui::Checkbox("Contours",  &g_slicerRenderer.showContours);
+        // Row 1: basic path types
+        if (ImGui::Checkbox("Contours",  &g_slicerRenderer.showContours)) g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
-        ImGui::Checkbox("Shells",    &g_slicerRenderer.showShells);
+        if (ImGui::Checkbox("Shells",    &g_slicerRenderer.showShells))   g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
-        ImGui::Checkbox("Infill",    &g_slicerRenderer.showInfill);
+        if (ImGui::Checkbox("Infill",    &g_slicerRenderer.showInfill))   g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
-        ImGui::Checkbox("Solid",     &g_slicerRenderer.showSolid);
+        if (ImGui::Checkbox("Solid",     &g_slicerRenderer.showSolid))    g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
-        ImGui::Checkbox("Travel",    &g_slicerRenderer.showTravel);
+        if (ImGui::Checkbox("Travel",    &g_slicerRenderer.showTravel))   g_slicerRenderer.markAllDirty();
+        // Row 2: support / skirt / raft
+        if (ImGui::Checkbox("Support",   &g_slicerRenderer.showSupport))  g_slicerRenderer.markAllDirty();
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Skirt",     &g_slicerRenderer.showSkirt))    g_slicerRenderer.markAllDirty();
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Raft",      &g_slicerRenderer.showRaft))     g_slicerRenderer.markAllDirty();
 
         // Layer range slider for 3D display
         int totalL = (int)g_sliceResult.layers.size();
@@ -793,11 +846,18 @@ static void renderSlicerTabContent() {
             ImGui::Image((ImTextureID)(intptr_t)thumbTex, {sz, sz},
                          {0, 1}, {1, 0});  // flip Y
             const auto& layer = g_sliceResult.layers[g_sliceLayerCur];
-            ImGui::TextDisabled("z=%.3f mm  contours=%zu  shells=%zu  infill=%zu",
-                layer.z,
-                layer.contours.size(),
-                layer.shells.empty() ? 0 : layer.shells[0].size(),
-                layer.infillPaths.size() + layer.solidPaths.size());
+            if (layer.isRaftLayer) {
+                ImGui::TextDisabled("[RAFT] z=%.3f mm  paths=%zu",
+                    layer.z, layer.raftPaths.size());
+            } else {
+                ImGui::TextDisabled("z=%.3f mm  contours=%zu  shells=%zu  infill=%zu  support=%zu  skirt=%zu",
+                    layer.z,
+                    layer.contours.size(),
+                    layer.shells.empty() ? 0 : layer.shells[0].size(),
+                    layer.infillPaths.size() + layer.solidPaths.size(),
+                    layer.supportPaths.size(),
+                    layer.skirtLoops.size());
+            }
         }
 
         // G-code export
@@ -1400,6 +1460,11 @@ int main(int /*argc*/, char** /*argv*/) {
         if (autoSliceFrame > 0) {
             autoSliceFrame++;
             if (autoSliceFrame == 5) {
+                // Enable skirt for demo
+                g_sliceParams.enableSkirt   = true;
+                g_sliceParams.skirtLoopCount = 2;
+                g_sliceParams.enableSupport  = true;  // enable support demo
+                g_sliceParams.supportAngle   = 45.0f;
                 // Execute slicer on boolean result
                 runSlicer();
                 g_showSliceOverlay = true;  // show slice paths in 3D

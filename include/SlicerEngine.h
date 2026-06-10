@@ -7,7 +7,10 @@
 //   2. Contour reconstruction   → ordered closed loops (Clipper-free, pure C++)
 //   3. Perimeter generation     → inset shells (offset by extrusion width)
 //   4. Infill pattern           → rectilinear (raster) or honeycomb
-//   5. Layer data output        → SliceLayer with contours + infill paths
+//   5. Support generation       → overhang detection + support grid
+//   6. Skirt generation         → outer perimeter priming lines
+//   7. Raft generation          → multi-layer adhesion base
+//   8. Layer data output        → SliceLayer with all path types
 //
 // All geometry is 2D (XY plane) per layer; Z is the layer height.
 // No external geometry library required beyond GLM.
@@ -51,6 +54,16 @@ struct SliceLayer {
     // Top/bottom solid fill paths
     std::vector<Path2> solidPaths;
 
+    // Support paths (grid lines below overhangs)
+    std::vector<Path2> supportPaths;
+
+    // Skirt paths (outer priming loops, first layer only)
+    std::vector<Loop2> skirtLoops;
+
+    // Raft paths (base adhesion layers, index < raftLayers)
+    std::vector<Path2> raftPaths;
+    bool               isRaftLayer = false;  // true for raft-only layers
+
     // Bounding box of this layer
     Vec2 bbMin, bbMax;
 };
@@ -77,6 +90,29 @@ struct SlicerParams {
     float filamentDiameter  = 1.75f;  // mm
     float retractionLength  = 1.0f;   // mm
     float retractionSpeed   = 45.0f;  // mm/s
+
+    // ---- Skirt ----
+    bool  enableSkirt       = true;   // generate skirt
+    int   skirtLoopCount    = 2;      // number of skirt loops
+    float skirtDistance     = 3.0f;   // mm gap from model
+    int   skirtLayers       = 1;      // number of layers to print skirt on
+
+    // ---- Raft ----
+    bool  enableRaft        = false;  // generate raft
+    int   raftBaseLayers    = 1;      // dense base layers
+    int   raftInterfaceLayers = 1;    // interface layers (finer)
+    float raftMargin        = 3.0f;   // mm expansion beyond model footprint
+    float raftAirGap        = 0.2f;   // mm gap between raft top and model bottom
+    float raftBaseSpeed     = 25.0f;  // mm/s (slow for adhesion)
+    float raftInterfaceSpeed= 40.0f;  // mm/s
+
+    // ---- Support ----
+    bool  enableSupport     = false;  // generate support structures
+    float supportAngle      = 45.0f;  // degrees — overhang threshold
+    float supportDensity    = 0.20f;  // support infill density (0–1)
+    float supportOffset     = 0.2f;   // mm gap between support and model
+    float supportSpeed      = 40.0f;  // mm/s
+    bool  supportEverywhere = false;  // false = build plate only
 };
 
 // ---------------------------------------------------------------------------
@@ -134,13 +170,29 @@ public:
         result.meshMax = bbMax;
 
         // --- 2. Determine layer Z positions ---
+        // If raft is enabled, prepend raft layers below the model
         std::vector<float> zLevels;
-        float zStart = bbMin.z + params.firstLayerHeight * 0.5f;
-        float zEnd   = bbMax.z - params.layerHeight * 0.5f;
-        if (zStart > zEnd) {
-            result.statusMsg = "Mesh too thin for given layer height";
-            return result;
+        float modelZStart = bbMin.z;
+
+        if (params.enableRaft) {
+            // Raft base layers
+            float raftH = params.firstLayerHeight;
+            float zRaft = bbMin.z - params.raftAirGap
+                          - (params.raftBaseLayers + params.raftInterfaceLayers) * raftH;
+            for (int r = 0; r < params.raftBaseLayers; ++r) {
+                zLevels.push_back(zRaft + r * raftH + raftH * 0.5f);
+            }
+            // Raft interface layers (slightly finer)
+            float zIface = zRaft + params.raftBaseLayers * raftH;
+            float ifaceH = raftH * 0.7f;
+            for (int r = 0; r < params.raftInterfaceLayers; ++r) {
+                zLevels.push_back(zIface + r * ifaceH + ifaceH * 0.5f);
+            }
         }
+
+        int raftLayerCount = (int)zLevels.size();
+
+        // Model layers
         zLevels.push_back(bbMin.z + params.firstLayerHeight);
         float z = bbMin.z + params.firstLayerHeight + params.layerHeight;
         while (z <= bbMax.z + 1e-4f) {
@@ -159,25 +211,57 @@ public:
             }
         }
 
-        // --- 4. Slice each layer ---
+        // --- 4. Compute model footprint for skirt/raft ---
+        // Use the first model layer contours as footprint
+        std::vector<Loop2> footprint;
+        {
+            std::vector<Seg2> segs;
+            intersectPlane(tris, zLevels[raftLayerCount], segs);
+            chainSegments(segs, footprint);
+        }
+        Vec2 footBBMin( 1e30f), footBBMax(-1e30f);
+        for (auto& loop : footprint)
+            for (auto& p : loop) {
+                footBBMin = glm::min(footBBMin, p);
+                footBBMax = glm::max(footBBMax, p);
+            }
+
+        // --- 5. Slice each layer ---
         result.layers.reserve(zLevels.size());
+        int totalWork = (int)zLevels.size();
+
         for (int li = 0; li < (int)zLevels.size(); ++li) {
             float zl = zLevels[li];
-            if (progress) progress(li, result.totalLayers, "Slicing layer " + std::to_string(li));
+            if (progress) progress(li, totalWork, "Slicing layer " + std::to_string(li));
 
-            // 4a. Plane-triangle intersection → raw segments
+            bool isRaft = (li < raftLayerCount);
+            int  modelLi = li - raftLayerCount;  // model-relative layer index
+
+            if (isRaft) {
+                // Generate raft layer
+                SliceLayer layer;
+                layer.z         = zl;
+                layer.index     = li;
+                layer.isRaftLayer = true;
+                layer.bbMin     = footBBMin - Vec2(params.raftMargin);
+                layer.bbMax     = footBBMax + Vec2(params.raftMargin);
+                generateRaftLayer(layer, params, li, raftLayerCount, footprint);
+                result.layers.push_back(std::move(layer));
+                continue;
+            }
+
+            // 5a. Plane-triangle intersection → raw segments
             std::vector<Seg2> segs;
             segs.reserve(256);
             intersectPlane(tris, zl, segs);
-
             if (segs.empty()) continue;
 
-            // 4b. Chain segments into closed loops
+            // 5b. Chain segments into closed loops
             std::vector<Loop2> contours;
             chainSegments(segs, contours);
             if (contours.empty()) continue;
 
-            // 4c. Compute bounding box
+            // 5c. Compute bounding box
             Vec2 lMin( 1e30f), lMax(-1e30f);
             for (auto& loop : contours)
                 for (auto& p : loop) { lMin = glm::min(lMin,p); lMax = glm::max(lMax,p); }
@@ -189,21 +273,31 @@ public:
             layer.bbMin    = lMin;
             layer.bbMax    = lMax;
 
-            // 4d. Generate perimeter shells
+            // 5d. Generate perimeter shells
             generateShells(layer, params);
 
-            // 4e. Generate infill
-            bool isSolid = (li < params.bottomLayers) ||
-                           (li >= result.totalLayers - params.topLayers);
+            // 5e. Generate infill
+            bool isSolid = (modelLi < params.bottomLayers) ||
+                           (modelLi >= (result.totalLayers - raftLayerCount) - params.topLayers);
             if (isSolid)
-                generateSolidFill(layer, params, li);
+                generateSolidFill(layer, params, modelLi);
             else
-                generateInfill(layer, params, li);
+                generateInfill(layer, params, modelLi);
+
+            // 5f. Generate skirt (first skirtLayers model layers only)
+            if (params.enableSkirt && modelLi < params.skirtLayers) {
+                generateSkirt(layer, params, footprint);
+            }
 
             result.layers.push_back(std::move(layer));
         }
 
-        // --- 5. Estimate print time and filament ---
+        // --- 6. Generate support structures ---
+        if (params.enableSupport && !tris.empty()) {
+            generateSupport(result, tris, params);
+        }
+
+        // --- 7. Estimate print time and filament ---
         estimatePrintStats(result);
 
         result.success   = true;
@@ -224,11 +318,9 @@ private:
                                 std::vector<Seg2>& segs)
     {
         for (auto& tri : tris) {
-            // Signed distances from plane z
             float d[3];
             for (int k = 0; k < 3; ++k) d[k] = tri.v[k].z - z;
 
-            // Count sign changes
             Vec2 pts[2]; int cnt = 0;
             for (int i = 0; i < 3 && cnt < 2; ++i) {
                 int j = (i+1) % 3;
@@ -245,19 +337,13 @@ private:
 
     // =========================================================================
     // Chain disconnected segments into closed loops
-    // Uses a spatial hash for O(n) endpoint matching
     // =========================================================================
     static void chainSegments(const std::vector<Seg2>& segs,
                                std::vector<Loop2>& loops)
     {
         const float EPS = 1e-4f;
 
-        // Build adjacency: endpoint → (seg_index, endpoint_index)
-        struct EndKey {
-            int   segIdx;
-            int   endIdx; // 0=a, 1=b
-        };
-        // Quantize to grid for fast lookup
+        struct EndKey { int segIdx; int endIdx; };
         auto quantize = [&](Vec2 p) -> std::pair<int,int> {
             return { (int)(p.x / EPS), (int)(p.y / EPS) };
         };
@@ -281,7 +367,6 @@ private:
             loop.push_back(segs[start].b);
             used[start] = true;
 
-            // Walk forward from segs[start].b
             Vec2 cur = segs[start].b;
             for (;;) {
                 auto key = encode(quantize(cur));
@@ -291,7 +376,7 @@ private:
                 if (used[si]) break;
                 used[si] = true;
                 Vec2 next = (it->second.endIdx == 0) ? segs[si].b : segs[si].a;
-                if (glm::distance(next, loop.front()) < EPS * 2) break; // closed
+                if (glm::distance(next, loop.front()) < EPS * 2) break;
                 loop.push_back(next);
                 cur = next;
             }
@@ -303,7 +388,6 @@ private:
 
     // =========================================================================
     // Generate perimeter shells by inward offsetting contours
-    // Simple vertex-normal offset (works well for convex/mildly concave shapes)
     // =========================================================================
     static void generateShells(SliceLayer& layer, const SlicerParams& p)
     {
@@ -331,12 +415,10 @@ private:
             Vec2 e1 = glm::normalize(curr - prev);
             Vec2 e2 = glm::normalize(next - curr);
 
-            // Inward normal (right-hand rule for CCW loops)
             Vec2 n1( e1.y, -e1.x);
             Vec2 n2( e2.y, -e2.x);
             Vec2 nm = glm::normalize(n1 + n2);
 
-            // Miter length
             float dot = glm::dot(nm, n1);
             float miter = (std::abs(dot) > 1e-4f) ? d / dot : d;
             miter = std::max(-3.0f * std::abs(d), std::min(3.0f * std::abs(d), miter));
@@ -356,19 +438,17 @@ private:
         float spacing = p.extrusionWidth / p.infillDensity;
         bool  horiz   = (layerIdx % 2 == 0);
 
-        Vec2 bbMin = layer.bbMin;
-        Vec2 bbMax = layer.bbMax;
-
         if (p.useHoneycomb) {
             generateHoneycombInfill(layer, p, layerIdx, spacing);
             return;
         }
 
-        // Raster lines
+        Vec2 bbMin = layer.bbMin;
+        Vec2 bbMax = layer.bbMax;
+
         if (horiz) {
             float y = bbMin.y + spacing * 0.5f;
             while (y <= bbMax.y) {
-                // Clip line against all contours (simple AABB clip for now)
                 Path2 line = { Vec2(bbMin.x - 1, y), Vec2(bbMax.x + 1, y) };
                 clipPathToContours(line, layer.contours, layer.infillPaths);
                 y += spacing;
@@ -416,16 +496,13 @@ private:
     static void generateHoneycombInfill(SliceLayer& layer, const SlicerParams& p,
                                          int layerIdx, float spacing)
     {
-        // Hexagonal grid with spacing as cell size
-        float hw = spacing;          // hex half-width
-        float hh = spacing * 0.866f; // hex half-height (sqrt(3)/2)
+        float hw = spacing;
+        float hh = spacing * 0.866f;
 
         Vec2 bbMin = layer.bbMin;
         Vec2 bbMax = layer.bbMax;
 
-        // Generate zigzag lines that form hex pattern
         bool even = (layerIdx % 2 == 0);
-        float step = hh * 2.0f;
         float x = bbMin.x - hw;
         while (x <= bbMax.x + hw) {
             Path2 path;
@@ -437,29 +514,231 @@ private:
                 y += hh;
                 ++seg;
             }
-            if (path.size() >= 2) {
+            if (path.size() >= 2)
                 clipPathToContours(path, layer.contours, layer.infillPaths);
-            }
             x += hw * 1.5f;
         }
     }
 
     // =========================================================================
-    // Clip a polyline against contour polygons using point-in-polygon test
-    // (Scanline intersection approach for each segment)
+    // Skirt generation
     // =========================================================================
-    static void clipPathToContours(const Path2& path,
-                                    const std::vector<Loop2>& contours,
-                                    std::vector<Path2>& out)
+    // Generates skirtLoopCount outward-offset loops around the model footprint.
+    // The first loop is at skirtDistance from the outermost contour.
+    static void generateSkirt(SliceLayer& layer,
+                               const SlicerParams& p,
+                               const std::vector<Loop2>& footprint)
     {
-        if (path.size() < 2 || contours.empty()) return;
+        // Use the layer's own contours if available, else fall back to footprint
+        const std::vector<Loop2>& base = layer.contours.empty() ? footprint : layer.contours;
+        if (base.empty()) return;
 
-        // For a horizontal or vertical line segment, find intersections with contours
-        // and output only the inside portions
+        for (int k = 0; k < p.skirtLoopCount; ++k) {
+            // Offset outward: positive offset = outward
+            float offset = p.skirtDistance + (k + 0.5f) * p.extrusionWidth;
+            for (auto& loop : base) {
+                Loop2 skirt = offsetLoop(loop, offset);
+                if (skirt.size() >= 3)
+                    layer.skirtLoops.push_back(std::move(skirt));
+            }
+        }
+    }
+
+    // =========================================================================
+    // Raft layer generation
+    // =========================================================================
+    // Generates a dense grid fill for the raft footprint (model footprint + margin).
+    static void generateRaftLayer(SliceLayer& layer,
+                                   const SlicerParams& p,
+                                   int li,
+                                   int totalRaftLayers,
+                                   const std::vector<Loop2>& footprint)
+    {
+        // Raft bounding box (footprint + margin)
+        Vec2 bbMin = layer.bbMin;
+        Vec2 bbMax = layer.bbMax;
+
+        // Determine spacing: base layers are coarser, interface layers are finer
+        bool isBase = (li < p.raftBaseLayers);
+        float spacing = isBase ? (p.extrusionWidth * 2.5f) : (p.extrusionWidth * 1.2f);
+        bool horiz = (li % 2 == 0);
+
+        // Generate dense rectilinear fill over the raft bounding box
+        // (no contour clipping needed — raft is a solid rectangle)
+        if (horiz) {
+            float y = bbMin.y;
+            while (y <= bbMax.y) {
+                layer.raftPaths.push_back({ Vec2(bbMin.x, y), Vec2(bbMax.x, y) });
+                y += spacing;
+            }
+        } else {
+            float x = bbMin.x;
+            while (x <= bbMax.x) {
+                layer.raftPaths.push_back({ Vec2(x, bbMin.y), Vec2(x, bbMax.y) });
+                x += spacing;
+            }
+        }
+
+        // Also add a border loop around the raft
+        if (li == 0) {
+            Loop2 border = {
+                bbMin,
+                Vec2(bbMax.x, bbMin.y),
+                bbMax,
+                Vec2(bbMin.x, bbMax.y)
+            };
+            layer.skirtLoops.push_back(border);  // reuse skirtLoops for raft border
+        }
+    }
+
+    // =========================================================================
+    // Support structure generation
+    // =========================================================================
+    // Algorithm:
+    //   For each layer i (from top to bottom):
+    //     1. Compute overhang area = contour[i] minus (contour[i-1] expanded by tan(angle)*layerH)
+    //     2. Accumulate support area downward (union with previous support)
+    //     3. Clip support area against model contour (avoid printing inside model)
+    //     4. Fill support area with sparse grid
+    // =========================================================================
+    static void generateSupport(SliceResult& result,
+                                 const std::vector<Tri>& tris,
+                                 const SlicerParams& p)
+    {
+        if (result.layers.empty()) return;
+
+        // Overhang threshold: horizontal distance a layer can extend per layer height
+        float maxOverhang = p.layerHeight * std::tan((90.0f - p.supportAngle) * (float)M_PI / 180.0f);
+
+        // Collect model-only layers (skip raft layers)
+        std::vector<SliceLayer*> modelLayers;
+        for (auto& layer : result.layers)
+            if (!layer.isRaftLayer) modelLayers.push_back(&layer);
+
+        if (modelLayers.size() < 2) return;
+
+        // For each layer, compute support area as AABB-based overhang approximation
+        // We use a simplified approach: for each contour point in layer[i],
+        // check if it is supported by layer[i-1] (expanded by maxOverhang).
+        // Unsupported points define the support region.
+
+        // Build per-layer bounding boxes for quick lookup
+        std::vector<Vec2> layerBBMin(modelLayers.size()), layerBBMax(modelLayers.size());
+        for (size_t i = 0; i < modelLayers.size(); ++i) {
+            layerBBMin[i] = modelLayers[i]->bbMin;
+            layerBBMax[i] = modelLayers[i]->bbMax;
+        }
+
+        // Process from top to bottom, accumulating support regions
+        // Support region per layer: list of AABB cells that need support
+        struct SupportCell {
+            Vec2 center;
+            float size;
+        };
+
+        float supportSpacing = p.extrusionWidth / std::max(0.05f, p.supportDensity);
+
+        for (int li = (int)modelLayers.size() - 1; li >= 1; --li) {
+            SliceLayer* cur  = modelLayers[li];
+            SliceLayer* prev = modelLayers[li - 1];
+
+            if (cur->contours.empty() || prev->contours.empty()) continue;
+
+            // For each point in current layer contours, check if it is
+            // within maxOverhang of the previous layer's contour region.
+            // Simplified: check if point is inside prev contours expanded by maxOverhang.
+
+            // Collect overhang points: points in cur that are NOT inside prev (expanded)
+            std::vector<Vec2> overhangPts;
+            for (auto& loop : cur->contours) {
+                for (auto& pt : loop) {
+                    // Check if pt is inside prev contours (with expansion)
+                    Vec2 expanded_pt = pt; // test point
+                    bool supported = false;
+
+                    // Quick AABB check with expansion
+                    Vec2 expMin = prev->bbMin - Vec2(maxOverhang);
+                    Vec2 expMax = prev->bbMax + Vec2(maxOverhang);
+                    if (pt.x >= expMin.x && pt.x <= expMax.x &&
+                        pt.y >= expMin.y && pt.y <= expMax.y) {
+                        // More precise: check if pt is inside any expanded contour
+                        // We approximate by checking if pt is inside the expanded AABB
+                        // For a more accurate check, we test against the original contour
+                        // with a tolerance equal to maxOverhang
+                        float minDist = 1e30f;
+                        for (auto& ploop : prev->contours) {
+                            int n = (int)ploop.size();
+                            for (int k = 0; k < n; ++k) {
+                                Vec2 a = ploop[k], b = ploop[(k+1)%n];
+                                // Distance from pt to segment ab
+                                Vec2 ab = b - a, ap = pt - a;
+                                float t = glm::clamp(glm::dot(ap, ab) / std::max(glm::dot(ab,ab), 1e-10f), 0.0f, 1.0f);
+                                float d = glm::distance(pt, a + t * ab);
+                                minDist = std::min(minDist, d);
+                            }
+                        }
+                        // If inside prev contour OR within maxOverhang of its boundary
+                        if (pointInContours(pt, prev->contours) || minDist <= maxOverhang)
+                            supported = true;
+                    }
+
+                    if (!supported)
+                        overhangPts.push_back(pt);
+                }
+            }
+
+            if (overhangPts.empty()) continue;
+
+            // Compute bounding box of overhang points
+            Vec2 supMin( 1e30f), supMax(-1e30f);
+            for (auto& pt : overhangPts) {
+                supMin = glm::min(supMin, pt);
+                supMax = glm::max(supMax, pt);
+            }
+            // Expand slightly
+            supMin -= Vec2(p.supportOffset + p.extrusionWidth);
+            supMax += Vec2(p.supportOffset + p.extrusionWidth);
+
+            // Generate support grid in the overhang bounding box,
+            // clipped to NOT be inside the model contour (avoid printing inside model)
+            bool horiz = (li % 2 == 0);
+            if (horiz) {
+                float y = supMin.y;
+                while (y <= supMax.y) {
+                    Path2 line = { Vec2(supMin.x, y), Vec2(supMax.x, y) };
+                    // Clip: keep parts that are NOT inside the model contour
+                    // (support is outside the model)
+                    clipPathOutsideContours(line, cur->contours, cur->supportPaths, p.supportOffset);
+                    y += supportSpacing;
+                }
+            } else {
+                float x = supMin.x;
+                while (x <= supMax.x) {
+                    Path2 line = { Vec2(x, supMin.y), Vec2(x, supMax.y) };
+                    clipPathOutsideContours(line, cur->contours, cur->supportPaths, p.supportOffset);
+                    x += supportSpacing;
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Clip a polyline: keep only segments OUTSIDE the contours (for support)
+    // offset: minimum distance from contour boundary
+    // =========================================================================
+    static void clipPathOutsideContours(const Path2& path,
+                                         const std::vector<Loop2>& contours,
+                                         std::vector<Path2>& out,
+                                         float offset = 0.0f)
+    {
+        if (path.size() < 2 || contours.empty()) {
+            if (path.size() >= 2) out.push_back(path);
+            return;
+        }
+
         for (size_t si = 0; si + 1 < path.size(); ++si) {
             Vec2 a = path[si], b = path[si+1];
 
-            // Collect all intersection t-values along segment a→b
             std::vector<float> ts;
             ts.push_back(0.0f);
             ts.push_back(1.0f);
@@ -480,22 +759,66 @@ private:
             ts.erase(std::unique(ts.begin(), ts.end(),
                 [](float x, float y){ return std::abs(x-y) < 1e-6f; }), ts.end());
 
-            // For each sub-segment, test midpoint against contours
+            for (size_t ti = 0; ti + 1 < ts.size(); ++ti) {
+                float tmid = (ts[ti] + ts[ti+1]) * 0.5f;
+                Vec2 mid = a + tmid * (b - a);
+                // Keep segment if midpoint is OUTSIDE contours
+                if (!pointInContours(mid, contours)) {
+                    Vec2 p0 = a + ts[ti]   * (b - a);
+                    Vec2 p1 = a + ts[ti+1] * (b - a);
+                    if (glm::distance(p0, p1) > 1e-4f)
+                        out.push_back({p0, p1});
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Clip a polyline against contour polygons (keep inside portions)
+    // =========================================================================
+    static void clipPathToContours(const Path2& path,
+                                    const std::vector<Loop2>& contours,
+                                    std::vector<Path2>& out)
+    {
+        if (path.size() < 2 || contours.empty()) return;
+
+        for (size_t si = 0; si + 1 < path.size(); ++si) {
+            Vec2 a = path[si], b = path[si+1];
+
+            std::vector<float> ts;
+            ts.push_back(0.0f);
+            ts.push_back(1.0f);
+
+            for (auto& loop : contours) {
+                int n = (int)loop.size();
+                for (int i = 0; i < n; ++i) {
+                    Vec2 c = loop[i], d = loop[(i+1)%n];
+                    float t, u;
+                    if (segIntersect(a, b, c, d, t, u)) {
+                        if (t > 1e-6f && t < 1.0f - 1e-6f)
+                            ts.push_back(t);
+                    }
+                }
+            }
+
+            std::sort(ts.begin(), ts.end());
+            ts.erase(std::unique(ts.begin(), ts.end(),
+                [](float x, float y){ return std::abs(x-y) < 1e-6f; }), ts.end());
+
             for (size_t ti = 0; ti + 1 < ts.size(); ++ti) {
                 float tmid = (ts[ti] + ts[ti+1]) * 0.5f;
                 Vec2 mid = a + tmid * (b - a);
                 if (pointInContours(mid, contours)) {
                     Vec2 p0 = a + ts[ti]   * (b - a);
                     Vec2 p1 = a + ts[ti+1] * (b - a);
-                    if (glm::distance(p0, p1) > 1e-4f) {
+                    if (glm::distance(p0, p1) > 1e-4f)
                         out.push_back({p0, p1});
-                    }
                 }
             }
         }
     }
 
-    // Segment-segment intersection: returns t along ab and u along cd
+    // Segment-segment intersection
     static bool segIntersect(Vec2 a, Vec2 b, Vec2 c, Vec2 d, float& t, float& u)
     {
         Vec2 ab = b - a, cd = d - c, ac = c - a;
@@ -506,7 +829,7 @@ private:
         return (u >= 0.0f && u <= 1.0f);
     }
 
-    // Point-in-polygon test (ray casting, handles multiple contours)
+    // Point-in-polygon test (ray casting)
     static bool pointInContours(Vec2 p, const std::vector<Loop2>& contours)
     {
         int crossings = 0;
@@ -531,32 +854,30 @@ private:
         const SlicerParams& p = result.params;
         float totalLen = 0.0f;
 
+        auto addLoopLen = [&](const Loop2& loop) {
+            if (loop.size() < 2) return;
+            for (size_t i = 0; i < loop.size(); ++i) {
+                float d = glm::distance(loop[i], loop[(i+1) % loop.size()]);
+                if (std::isfinite(d)) totalLen += d;
+            }
+        };
+        auto addPathLen = [&](const Path2& path) {
+            for (size_t i = 0; i + 1 < path.size(); ++i) {
+                float d = glm::distance(path[i], path[i+1]);
+                if (std::isfinite(d)) totalLen += d;
+            }
+        };
+
         for (auto& layer : result.layers) {
-            // Perimeter length
             for (auto& shellGroup : layer.shells)
-                for (auto& loop : shellGroup) {
-                    if (loop.size() < 2) continue;
-                    for (size_t i = 0; i < loop.size(); ++i) {
-                        float d = glm::distance(loop[i], loop[(i+1) % loop.size()]);
-                        if (std::isfinite(d)) totalLen += d;
-                    }
-                }
-
-            // Infill length
-            for (auto& path : layer.infillPaths)
-                for (size_t i = 0; i + 1 < path.size(); ++i) {
-                    float d = glm::distance(path[i], path[i+1]);
-                    if (std::isfinite(d)) totalLen += d;
-                }
-
-            for (auto& path : layer.solidPaths)
-                for (size_t i = 0; i + 1 < path.size(); ++i) {
-                    float d = glm::distance(path[i], path[i+1]);
-                    if (std::isfinite(d)) totalLen += d;
-                }
+                for (auto& loop : shellGroup) addLoopLen(loop);
+            for (auto& path : layer.infillPaths)  addPathLen(path);
+            for (auto& path : layer.solidPaths)   addPathLen(path);
+            for (auto& path : layer.supportPaths) addPathLen(path);
+            for (auto& loop : layer.skirtLoops)   addLoopLen(loop);
+            for (auto& path : layer.raftPaths)    addPathLen(path);
         }
 
-        // Filament volume = extrusion cross-section × path length
         float crossSection = (float)M_PI * (p.nozzleDiameter * 0.5f) * (p.nozzleDiameter * 0.5f);
         float filamentCrossSection = (float)M_PI * (p.filamentDiameter * 0.5f) * (p.filamentDiameter * 0.5f);
         float filamentLen = (filamentCrossSection > 0.0f)
@@ -564,9 +885,7 @@ private:
             : 0.0f;
         result.estimatedFilament = std::isfinite(filamentLen) ? filamentLen : 0.0f;
 
-        // Time estimate (rough: total length / average speed)
-        // avgSpeed in mm/s, totalLen in mm → time in seconds
-        float avgSpeed = p.printSpeed * 0.8f; // account for acceleration
+        float avgSpeed = p.printSpeed * 0.8f;
         float t = (avgSpeed > 0.0f) ? (totalLen / avgSpeed) : 0.0f;
         result.estimatedTime = std::isfinite(t) ? t : 0.0f;
     }

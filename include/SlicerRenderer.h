@@ -4,14 +4,18 @@
 // =============================================================================
 // Provides two rendering modes:
 //   1. Layer-by-layer 2D preview (FBO → ImGui::Image thumbnail per layer)
-//   2. 3D G-code path visualization (colored line segments in main viewport)
+//   2. 3D slice path visualization (colored line segments in main viewport)
 //
 // Color coding:
-//   Perimeter shell 0 (outer) : white / bright
-//   Perimeter shell 1+        : cyan
-//   Solid fill                : yellow
-//   Infill                    : green
-//   Travel moves              : gray (thin, optional)
+//   Contour (raw intersection)  : orange
+//   Perimeter shell 0 (outer)   : white
+//   Perimeter shell 1+ (inner)  : cyan
+//   Solid fill                  : yellow
+//   Infill                      : green
+//   Support                     : magenta / purple
+//   Skirt                       : light blue
+//   Raft                        : brown / tan
+//   Travel moves                : gray (thin, optional)
 // =============================================================================
 
 #include "SlicerEngine.h"
@@ -55,7 +59,7 @@ struct LineBuffer {
     }
 
     void destroy() {
-        if (vao) { glDeleteVertexArrays(1, &vao); glDeleteBuffers(1, &vbo); vao = vbo = 0; }
+        if (vao) { glDeleteVertexArrays(1, &vao); glDeleteBuffers(1, &vbo); vao = vbo = 0; count = 0; }
     }
 };
 
@@ -98,19 +102,26 @@ struct LayerThumb {
 // ---------------------------------------------------------------------------
 class SlicerRenderer {
 public:
-    // Color palette
+    // ---- Color palette ----
     static constexpr glm::vec3 COL_OUTER_SHELL = {1.0f, 1.0f, 1.0f};
     static constexpr glm::vec3 COL_INNER_SHELL = {0.4f, 0.9f, 1.0f};
     static constexpr glm::vec3 COL_SOLID_FILL  = {1.0f, 0.9f, 0.2f};
     static constexpr glm::vec3 COL_INFILL      = {0.3f, 0.9f, 0.3f};
     static constexpr glm::vec3 COL_TRAVEL      = {0.4f, 0.4f, 0.4f};
     static constexpr glm::vec3 COL_CONTOUR     = {1.0f, 0.5f, 0.1f};
+    static constexpr glm::vec3 COL_SUPPORT     = {0.85f, 0.3f, 0.85f};  // magenta
+    static constexpr glm::vec3 COL_SKIRT       = {0.3f, 0.7f, 1.0f};    // light blue
+    static constexpr glm::vec3 COL_RAFT        = {0.8f, 0.6f, 0.3f};    // tan/brown
 
+    // ---- Visibility toggles ----
     bool showTravel    = false;
     bool showShells    = true;
     bool showInfill    = true;
     bool showSolid     = true;
     bool showContours  = true;
+    bool showSupport   = true;
+    bool showSkirt     = true;
+    bool showRaft      = true;
 
     // Current layer range to display in 3D view
     int  displayLayerMin = 0;
@@ -118,7 +129,6 @@ public:
 
     // ---- Initialization ----
     bool init() {
-        // Simple line shader (pos + color)
         const char* vert = R"(
 #version 330 core
 layout(location=0) in vec3 aPos;
@@ -147,37 +157,31 @@ void main() { FragColor = vec4(vCol, 1.0); }
 
         if (!result.success) return;
 
-        // Build per-layer line buffers
         m_layerBuffers.resize(result.layers.size());
-        for (size_t li = 0; li < result.layers.size(); ++li) {
+        for (size_t li = 0; li < result.layers.size(); ++li)
             buildLayerBuffer(result.layers[li], m_layerBuffers[li]);
-        }
 
-        // Build full 3D buffer (all layers combined)
         buildFullBuffer(result);
 
-        // Init thumbnails (lazy: rendered on first access)
         m_layerThumbs.resize(result.layers.size());
         for (auto& t : m_layerThumbs) t.init(256, 256);
     }
 
-    // ---- Build from G-code moves ----
+    // ---- Build from G-code moves (with semantic pathType) ----
     void buildFromGcode(const std::vector<GcodeExporter::GcodeMove>& moves) {
         m_gcodeBuffer.destroy();
         std::vector<LineBuffer::Vertex> verts;
         verts.reserve(moves.size() * 2);
         for (auto& mv : moves) {
             if (mv.isTravel && !showTravel) continue;
-            glm::vec3 col = mv.isTravel ? COL_TRAVEL :
-                            (mv.extrusion > 0.01f ? COL_OUTER_SHELL : COL_INNER_SHELL);
+            glm::vec3 col = colorForPathType(mv.pathType, mv.isTravel);
             verts.push_back({mv.from, col});
             verts.push_back({mv.to,   col});
         }
         m_gcodeBuffer.upload(verts);
     }
 
-    // ---- Render 3D view (call from main render loop) ----
-    // Overload 1: pre-combined VP matrix
+    // ---- Render 3D view ----
     void render3D(const glm::mat4& vp) {
         if (!m_shader) return;
         glUseProgram(m_shader);
@@ -191,10 +195,8 @@ void main() { FragColor = vec4(vCol, 1.0); }
         glUseProgram(0);
     }
 
-    // Overload 2: separate view + proj + explicit layer range
     void render3D(const glm::mat4& view, const glm::mat4& proj, int layerMin, int layerMax) {
         glm::mat4 vp = proj * view;
-        // Temporarily override display range
         int savedMin = displayLayerMin, savedMax = displayLayerMax;
         displayLayerMin = layerMin; displayLayerMax = layerMax;
         render3D(vp);
@@ -215,7 +217,6 @@ void main() { FragColor = vec4(vCol, 1.0); }
     }
 
     // ---- Render layer thumbnail to FBO ----
-    // Returns OpenGL texture ID for ImGui::Image()
     GLuint renderLayerThumb(int layerIdx) {
         if (layerIdx < 0 || layerIdx >= (int)m_layerThumbs.size()) return 0;
         auto& thumb = m_layerThumbs[layerIdx];
@@ -228,8 +229,12 @@ void main() { FragColor = vec4(vCol, 1.0); }
         glClearColor(0.12f, 0.12f, 0.14f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // Orthographic projection fitting the layer bounding box
+        // Compute orthographic projection fitting the layer
         Vec2 bbMin = layer.bbMin, bbMax = layer.bbMax;
+        // For raft layers, use the raft bounding box
+        if (layer.isRaftLayer) {
+            bbMin = layer.bbMin; bbMax = layer.bbMax;
+        }
         float cx = (bbMin.x + bbMax.x) * 0.5f;
         float cy = (bbMin.y + bbMax.y) * 0.5f;
         float hw = (bbMax.x - bbMin.x) * 0.6f + 1.0f;
@@ -249,7 +254,6 @@ void main() { FragColor = vec4(vCol, 1.0); }
         return thumb.colorTex;
     }
 
-    // Mark all thumbnails dirty (e.g., after visibility toggle)
     void markAllDirty() {
         for (auto& t : m_layerThumbs) t.dirty = true;
     }
@@ -264,6 +268,22 @@ void main() { FragColor = vec4(vCol, 1.0); }
 
     int layerCount() const { return (int)m_layerBuffers.size(); }
 
+    // ---- Color legend for UI ----
+    // Returns (r,g,b) for a given feature type name
+    static glm::vec3 colorForFeature(const char* name) {
+        std::string s(name);
+        if (s == "shell_outer") return COL_OUTER_SHELL;
+        if (s == "shell_inner") return COL_INNER_SHELL;
+        if (s == "solid")       return COL_SOLID_FILL;
+        if (s == "infill")      return COL_INFILL;
+        if (s == "support")     return COL_SUPPORT;
+        if (s == "skirt")       return COL_SKIRT;
+        if (s == "raft")        return COL_RAFT;
+        if (s == "travel")      return COL_TRAVEL;
+        if (s == "contour")     return COL_CONTOUR;
+        return {1,1,1};
+    }
+
 private:
     GLuint                   m_shader = 0;
     const SliceResult*       m_result = nullptr;
@@ -271,6 +291,20 @@ private:
     std::vector<LayerThumb>  m_layerThumbs;
     LineBuffer               m_fullBuffer;
     LineBuffer               m_gcodeBuffer;
+
+    // Map pathType integer to display color
+    glm::vec3 colorForPathType(int pathType, bool isTravel) const {
+        if (isTravel) return COL_TRAVEL;
+        switch (pathType) {
+            case 1: return COL_OUTER_SHELL;
+            case 2: return COL_INFILL;
+            case 3: return COL_SOLID_FILL;
+            case 4: return COL_SUPPORT;
+            case 5: return COL_SKIRT;
+            case 6: return COL_RAFT;
+            default: return COL_OUTER_SHELL;
+        }
+    }
 
     // ---- Build GPU line buffer for one layer ----
     void buildLayerBuffer(const SliceLayer& layer, LineBuffer& buf) {
@@ -293,9 +327,27 @@ private:
             }
         };
 
+        // Raft layer: only raft paths and border
+        if (layer.isRaftLayer) {
+            if (showRaft) {
+                for (auto& path : layer.raftPaths)  addPath(path, COL_RAFT);
+                for (auto& loop : layer.skirtLoops) addLoop(loop, COL_RAFT * 1.2f);
+            }
+            buf.upload(verts);
+            return;
+        }
+
         // Contours
         if (showContours)
             for (auto& loop : layer.contours) addLoop(loop, COL_CONTOUR);
+
+        // Skirt
+        if (showSkirt)
+            for (auto& loop : layer.skirtLoops) addLoop(loop, COL_SKIRT);
+
+        // Support
+        if (showSupport)
+            for (auto& path : layer.supportPaths) addPath(path, COL_SUPPORT);
 
         // Shells
         if (showShells) {
@@ -329,12 +381,19 @@ private:
                     verts.push_back({{b.x, b.y, layer.z}, col});
                 }
             };
+            if (layer.isRaftLayer) {
+                if (showRaft)
+                    for (auto& loop : layer.skirtLoops) addLoop(loop, COL_RAFT);
+                continue;
+            }
             if (showShells) {
                 for (int s = 0; s < (int)layer.shells.size(); ++s) {
                     glm::vec3 col = (s == 0) ? COL_OUTER_SHELL : COL_INNER_SHELL;
                     for (auto& loop : layer.shells[s]) addLoop(loop, col);
                 }
             }
+            if (showSkirt)
+                for (auto& loop : layer.skirtLoops) addLoop(loop, COL_SKIRT);
         }
         m_fullBuffer.upload(verts);
     }
