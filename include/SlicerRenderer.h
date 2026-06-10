@@ -103,25 +103,29 @@ struct LayerThumb {
 class SlicerRenderer {
 public:
     // ---- Color palette ----
-    static constexpr glm::vec3 COL_OUTER_SHELL = {1.0f, 1.0f, 1.0f};
-    static constexpr glm::vec3 COL_INNER_SHELL = {0.4f, 0.9f, 1.0f};
-    static constexpr glm::vec3 COL_SOLID_FILL  = {1.0f, 0.9f, 0.2f};
-    static constexpr glm::vec3 COL_INFILL      = {0.3f, 0.9f, 0.3f};
-    static constexpr glm::vec3 COL_TRAVEL      = {0.4f, 0.4f, 0.4f};
-    static constexpr glm::vec3 COL_CONTOUR     = {1.0f, 0.5f, 0.1f};
-    static constexpr glm::vec3 COL_SUPPORT     = {0.85f, 0.3f, 0.85f};  // magenta
-    static constexpr glm::vec3 COL_SKIRT       = {0.3f, 0.7f, 1.0f};    // light blue
-    static constexpr glm::vec3 COL_RAFT        = {0.8f, 0.6f, 0.3f};    // tan/brown
+    static constexpr glm::vec3 COL_OUTER_SHELL    = {1.0f, 1.0f, 1.0f};
+    static constexpr glm::vec3 COL_INNER_SHELL    = {0.4f, 0.9f, 1.0f};
+    static constexpr glm::vec3 COL_SOLID_FILL     = {1.0f, 0.9f, 0.2f};
+    static constexpr glm::vec3 COL_INFILL         = {0.3f, 0.9f, 0.3f};
+    static constexpr glm::vec3 COL_TRAVEL         = {0.4f, 0.4f, 0.4f};
+    static constexpr glm::vec3 COL_CONTOUR        = {1.0f, 0.5f, 0.1f};
+    static constexpr glm::vec3 COL_SUPPORT        = {0.85f, 0.3f, 0.85f};  // magenta
+    static constexpr glm::vec3 COL_SKIRT          = {0.3f, 0.7f, 1.0f};    // light blue
+    static constexpr glm::vec3 COL_RAFT           = {0.8f, 0.6f, 0.3f};    // tan/brown
+    static constexpr glm::vec3 COL_BRIDGE         = {0.2f, 0.8f, 0.9f};    // teal (bridge fill)
+    static constexpr glm::vec3 COL_SUPPORT_IFACE  = {1.0f, 0.5f, 0.8f};    // pink (support interface)
 
     // ---- Visibility toggles ----
-    bool showTravel    = false;
-    bool showShells    = true;
-    bool showInfill    = true;
-    bool showSolid     = true;
-    bool showContours  = true;
-    bool showSupport   = true;
-    bool showSkirt     = true;
-    bool showRaft      = true;
+    bool showTravel        = false;
+    bool showShells        = true;
+    bool showInfill        = true;
+    bool showSolid         = true;
+    bool showContours      = true;
+    bool showSupport       = true;
+    bool showSkirt         = true;
+    bool showRaft          = true;
+    bool showBridge        = true;
+    bool showSupportIface  = true;
 
     // Current layer range to display in 3D view
     int  displayLayerMin = 0;
@@ -272,15 +276,17 @@ void main() { FragColor = vec4(vCol, 1.0); }
     // Returns (r,g,b) for a given feature type name
     static glm::vec3 colorForFeature(const char* name) {
         std::string s(name);
-        if (s == "shell_outer") return COL_OUTER_SHELL;
-        if (s == "shell_inner") return COL_INNER_SHELL;
-        if (s == "solid")       return COL_SOLID_FILL;
-        if (s == "infill")      return COL_INFILL;
-        if (s == "support")     return COL_SUPPORT;
-        if (s == "skirt")       return COL_SKIRT;
-        if (s == "raft")        return COL_RAFT;
-        if (s == "travel")      return COL_TRAVEL;
-        if (s == "contour")     return COL_CONTOUR;
+        if (s == "shell_outer")    return COL_OUTER_SHELL;
+        if (s == "shell_inner")    return COL_INNER_SHELL;
+        if (s == "solid")          return COL_SOLID_FILL;
+        if (s == "infill")         return COL_INFILL;
+        if (s == "support")        return COL_SUPPORT;
+        if (s == "support_iface")  return COL_SUPPORT_IFACE;
+        if (s == "bridge")         return COL_BRIDGE;
+        if (s == "skirt")          return COL_SKIRT;
+        if (s == "raft")           return COL_RAFT;
+        if (s == "travel")         return COL_TRAVEL;
+        if (s == "contour")        return COL_CONTOUR;
         return {1,1,1};
     }
 
@@ -293,6 +299,8 @@ private:
     LineBuffer               m_gcodeBuffer;
 
     // Map pathType integer to display color
+    // 0=travel, 1=outer_shell, 2=infill, 3=solid, 4=support,
+    // 5=skirt, 6=raft, 7=bridge, 8=support_interface, 9=inner_shell
     glm::vec3 colorForPathType(int pathType, bool isTravel) const {
         if (isTravel) return COL_TRAVEL;
         switch (pathType) {
@@ -302,6 +310,9 @@ private:
             case 4: return COL_SUPPORT;
             case 5: return COL_SKIRT;
             case 6: return COL_RAFT;
+            case 7: return COL_BRIDGE;
+            case 8: return COL_SUPPORT_IFACE;
+            case 9: return COL_INNER_SHELL;
             default: return COL_OUTER_SHELL;
         }
     }
@@ -349,6 +360,10 @@ private:
         if (showSupport)
             for (auto& path : layer.supportPaths) addPath(path, COL_SUPPORT);
 
+        // Support interface
+        if (showSupportIface)
+            for (auto& path : layer.supportInterfacePaths) addPath(path, COL_SUPPORT_IFACE);
+
         // Shells
         if (showShells) {
             for (int s = 0; s < (int)layer.shells.size(); ++s) {
@@ -360,6 +375,10 @@ private:
         // Solid fill
         if (showSolid)
             for (auto& path : layer.solidPaths) addPath(path, COL_SOLID_FILL);
+
+        // Bridge fill
+        if (showBridge)
+            for (auto& path : layer.bridgePaths) addPath(path, COL_BRIDGE);
 
         // Infill
         if (showInfill)

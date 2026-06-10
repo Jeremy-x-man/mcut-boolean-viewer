@@ -701,7 +701,19 @@ static void renderSlicerTabContent() {
     ImGui::SetNextItemWidth(110);
     ImGui::SliderInt("Bottom Layers",            &g_sliceParams.bottomLayers,     0, 10);
 
-    ImGui::Checkbox("Honeycomb Infill",          &g_sliceParams.useHoneycomb);
+    // Infill pattern selection
+    ImGui::Text("Infill Pattern:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Rectilinear", !g_sliceParams.useHoneycomb && !g_sliceParams.useGyroid))
+        { g_sliceParams.useHoneycomb = false; g_sliceParams.useGyroid = false; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Honeycomb", g_sliceParams.useHoneycomb))
+        { g_sliceParams.useHoneycomb = true; g_sliceParams.useGyroid = false; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Gyroid", g_sliceParams.useGyroid))
+        { g_sliceParams.useHoneycomb = false; g_sliceParams.useGyroid = true; }
+
+    ImGui::Checkbox("Alternate Fill Angle (±45°)", &g_sliceParams.fillAngleAlternate);
 
     // ---- Skirt ----
     ImGui::SeparatorText("Skirt");
@@ -747,15 +759,26 @@ static void renderSlicerTabContent() {
         g_sliceParams.supportOffset = std::max(0.0f, std::min(2.0f, g_sliceParams.supportOffset));
         ImGui::SetNextItemWidth(110);
         ImGui::InputFloat("Support Spd (mm/s)",   &g_sliceParams.supportSpeed,    5.0f, 10.0f, "%.0f");
+        ImGui::Checkbox("Support Interface Layer", &g_sliceParams.supportInterface);
+        if (g_sliceParams.supportInterface) {
+            ImGui::SetNextItemWidth(110);
+            float ifacePct = g_sliceParams.supportInterfaceDensity * 100.0f;
+            if (ImGui::SliderFloat("Interface Density", &ifacePct, 50.0f, 100.0f, "%.0f%%"))
+                g_sliceParams.supportInterfaceDensity = ifacePct / 100.0f;
+        }
     }
 
     ImGui::SeparatorText("Print Speed");
     ImGui::SetNextItemWidth(110);
-    ImGui::InputFloat("Print (mm/s)",            &g_sliceParams.printSpeed,       5.0f, 10.0f, "%.0f");
+    ImGui::InputFloat("Outer Perim (mm/s)",      &g_sliceParams.outerPerimSpeed,  5.0f, 10.0f, "%.0f");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Inner Perim (mm/s)",      &g_sliceParams.innerPerimSpeed,  5.0f, 10.0f, "%.0f");
     ImGui::SetNextItemWidth(110);
     ImGui::InputFloat("Travel (mm/s)",           &g_sliceParams.travelSpeed,      5.0f, 10.0f, "%.0f");
     ImGui::SetNextItemWidth(110);
     ImGui::InputFloat("Infill (mm/s)",           &g_sliceParams.infillSpeed,      5.0f, 10.0f, "%.0f");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Bridge (mm/s)",           &g_sliceParams.bridgeSpeed,      5.0f, 10.0f, "%.0f");
 
     ImGui::SeparatorText("Temperature");
     ImGui::SetNextItemWidth(110);
@@ -768,6 +791,19 @@ static void renderSlicerTabContent() {
     ImGui::InputFloat("Diameter (mm)",           &g_sliceParams.filamentDiameter, 0.1f, 0.5f, "%.2f");
     ImGui::SetNextItemWidth(110);
     ImGui::InputFloat("Retraction (mm)",         &g_sliceParams.retractionLength, 0.1f, 0.5f, "%.1f");
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Min Travel Retract (mm)", &g_sliceParams.minTravelForRetract, 0.5f, 1.0f, "%.1f");
+
+    ImGui::SeparatorText("Advanced (BambuStudio)");
+    ImGui::Checkbox("Arc Fitting (G2/G3)",       &g_sliceParams.enableArcFitting);
+    if (g_sliceParams.enableArcFitting) {
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Arc Tolerance (mm)",  &g_sliceParams.arcTolerance, 0.01f, 0.05f, "%.3f");
+        g_sliceParams.arcTolerance = std::max(0.01f, std::min(0.5f, g_sliceParams.arcTolerance));
+    }
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Outer Extr.W (mm)",       &g_sliceParams.outerExtrusionWidth, 0.05f, 0.1f, "%.2f");
+    g_sliceParams.outerExtrusionWidth = std::max(0.1f, std::min(1.0f, g_sliceParams.outerExtrusionWidth));
 
     ImGui::Spacing();
     // Slice button
@@ -812,12 +848,16 @@ static void renderSlicerTabContent() {
         if (ImGui::Checkbox("Solid",     &g_slicerRenderer.showSolid))    g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
         if (ImGui::Checkbox("Travel",    &g_slicerRenderer.showTravel))   g_slicerRenderer.markAllDirty();
-        // Row 2: support / skirt / raft
-        if (ImGui::Checkbox("Support",   &g_slicerRenderer.showSupport))  g_slicerRenderer.markAllDirty();
+        // Row 2: support / skirt / raft / bridge
+        if (ImGui::Checkbox("Support",   &g_slicerRenderer.showSupport))     g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
-        if (ImGui::Checkbox("Skirt",     &g_slicerRenderer.showSkirt))    g_slicerRenderer.markAllDirty();
+        if (ImGui::Checkbox("S.Iface",   &g_slicerRenderer.showSupportIface))g_slicerRenderer.markAllDirty();
         ImGui::SameLine();
-        if (ImGui::Checkbox("Raft",      &g_slicerRenderer.showRaft))     g_slicerRenderer.markAllDirty();
+        if (ImGui::Checkbox("Bridge",    &g_slicerRenderer.showBridge))      g_slicerRenderer.markAllDirty();
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Skirt",     &g_slicerRenderer.showSkirt))       g_slicerRenderer.markAllDirty();
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Raft",      &g_slicerRenderer.showRaft))        g_slicerRenderer.markAllDirty();
 
         // Layer range slider for 3D display
         int totalL = (int)g_sliceResult.layers.size();
