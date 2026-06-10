@@ -805,6 +805,58 @@ static void renderSlicerTabContent() {
     ImGui::InputFloat("Outer Extr.W (mm)",       &g_sliceParams.outerExtrusionWidth, 0.05f, 0.1f, "%.2f");
     g_sliceParams.outerExtrusionWidth = std::max(0.1f, std::min(1.0f, g_sliceParams.outerExtrusionWidth));
 
+    // ---- Cooling Pass ----
+    ImGui::SeparatorText("Cooling (CoolingPass)");
+    ImGui::Checkbox("Cooling Slowdown",          &g_sliceParams.enableCoolingSlowdown);
+    if (g_sliceParams.enableCoolingSlowdown) {
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Min Layer Time (s)",   &g_sliceParams.minLayerTime, 1.0f, 5.0f, "%.0f");
+        g_sliceParams.minLayerTime = std::max(1.0f, std::min(60.0f, g_sliceParams.minLayerTime));
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Min Print Spd (mm/s)",&g_sliceParams.minPrintSpeed, 1.0f, 5.0f, "%.0f");
+    }
+
+    // ---- Fan Control Pass ----
+    ImGui::SeparatorText("Fan Control (FanControlPass)");
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("First Fan Layer",          &g_sliceParams.firstFanLayer, 0, 10);
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("Min Fan Speed",            &g_sliceParams.minFanSpeed, 0, 255);
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("Max Fan Speed",            &g_sliceParams.maxFanSpeed, 0, 255);
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("Bridge Fan Speed",         &g_sliceParams.bridgeFanSpeed, 0, 255);
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputFloat("Fan Max Layer Time (s)",  &g_sliceParams.fanMaxLayerTime, 5.0f, 10.0f, "%.0f");
+
+    // ---- Z-hop + Wipe ----
+    ImGui::SeparatorText("Z-Hop & Wipe (RetractPass)");
+    ImGui::Checkbox("Enable Z-Hop",              &g_sliceParams.enableZHop);
+    if (g_sliceParams.enableZHop) {
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Z-Hop Height (mm)",   &g_sliceParams.zHopHeight, 0.05f, 0.1f, "%.2f");
+        g_sliceParams.zHopHeight = std::max(0.05f, std::min(2.0f, g_sliceParams.zHopHeight));
+    }
+    ImGui::Checkbox("Wipe Before Retract",       &g_sliceParams.enableWipe);
+    if (g_sliceParams.enableWipe) {
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Wipe Distance (mm)",  &g_sliceParams.wipeDistance, 0.1f, 0.5f, "%.1f");
+        g_sliceParams.wipeDistance = std::max(0.1f, std::min(5.0f, g_sliceParams.wipeDistance));
+    }
+
+    // ---- Pressure Advance ----
+    ImGui::SeparatorText("Pressure Advance (PressureAdvPass)");
+    ImGui::Checkbox("Enable Pressure Advance",   &g_sliceParams.enablePressureAdvance);
+    if (g_sliceParams.enablePressureAdvance) {
+        ImGui::Checkbox("Klipper (SET_PA)",       &g_sliceParams.paUseKlipper);
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Outer Shell PA",       &g_sliceParams.paOuterShell, 0.005f, 0.01f, "%.3f");
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Inner Shell PA",       &g_sliceParams.paInnerShell, 0.005f, 0.01f, "%.3f");
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputFloat("Infill PA",            &g_sliceParams.paInfill, 0.005f, 0.01f, "%.3f");
+    }
+
     ImGui::Spacing();
     // Slice button
     ImGui::PushStyleColor(ImGuiCol_Button,        {0.15f, 0.60f, 0.25f, 1.0f});

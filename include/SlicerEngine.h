@@ -203,6 +203,33 @@ struct SlicerParams {
     float arcTolerance        = 0.05f;   // mm — max deviation from arc
     float arcMinRadius        = 0.5f;    // mm — min arc radius
     float arcMaxRadius        = 100.0f;  // mm — max arc radius
+
+    // ---- Cooling (CoolingPass) ----
+    bool  enableCoolingSlowdown = true;
+    float minLayerTime          = 8.0f;  // s — slow down if layer faster than this
+    float fanMaxLayerTime       = 60.0f; // s — full fan if layer faster than this
+    float minPrintSpeed         = 10.0f; // mm/s — floor for cooling slowdown
+
+    // ---- Fan control (FanControlPass) ----
+    int   firstFanLayer         = 3;     // enable fan after this layer index
+    int   minFanSpeed           = 50;    // 0-255
+    int   maxFanSpeed           = 255;   // 0-255
+    int   bridgeFanSpeed        = 255;   // 0-255 — full fan for bridges
+
+    // ---- Z-hop (RetractPass) ----
+    bool  enableZHop            = false;
+    float zHopHeight            = 0.2f;  // mm
+
+    // ---- Wipe before retract (WipePass) ----
+    bool  enableWipe            = true;
+    float wipeDistance          = 1.5f;  // mm
+
+    // ---- Pressure advance (PressureAdvPass) ----
+    bool  enablePressureAdvance = false;
+    float paOuterShell          = 0.04f;
+    float paInnerShell          = 0.04f;
+    float paInfill              = 0.08f;
+    bool  paUseKlipper          = true;  // SET_PRESSURE_ADVANCE vs M572
 };
 
 // ---------------------------------------------------------------------------
